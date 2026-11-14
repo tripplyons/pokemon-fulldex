@@ -637,7 +637,12 @@ void WideGpuBuild(const GPU& gpu, Polygon* const* list, u32 count, int W, int H,
     // ((31 + 1) * (a + 1) - 1 >> 5 is a): 4, 16 or 256 colours with colour 0 not transparent.
     // Such a polygon is then tested early with nothing lost: no pixel of it is discarded after
     // the stencil has its ID (see SSR_WIDEGPU_EARLYTRANS below).
+    // (On by default on Android; SSR_WIDEGPU_SAFEEARLY=0 or 1 chooses.)
+#ifdef __ANDROID__
+    static const bool safeEarly = !getenv("SSR_WIDEGPU_SAFEEARLY") || getenv("SSR_WIDEGPU_SAFEEARLY")[0] != '0';
+#else
     static const bool safeEarly = getenv("SSR_WIDEGPU_SAFEEARLY") && !strcmp(getenv("SSR_WIDEGPU_SAFEEARLY"), "1");
+#endif
     auto translucentNeverDiscards = [&](const Polygon* poly) {
         const u32 polyAlpha = (poly->Attr >> 16) & 31;
         if (polyAlpha == 0 || polyAlpha == 31 || polyAlpha <= g.RenderAlphaRef) return false;

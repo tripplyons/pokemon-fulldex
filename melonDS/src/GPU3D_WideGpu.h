@@ -247,7 +247,7 @@ extern bool WideGpuGLThreaded;
 // Set by the frontend: lets go of the context on the calling thread (that thread's end).
 extern void (*WideGpuGLRelease)();
 #ifdef __ANDROID__
-// SSR_WIDE_ZEROCOPY=1 (Android, off by default): the widescreen picture is drawn straight into
+// Zero copy (Android, on by default; SSR_WIDE_ZEROCOPY=0 turns it off): the widescreen picture is drawn straight into
 // textures of SDL's renderer, one a slot, instead of being read back and uploaded again
 // (frontend/widezc.h). The worker's context then shares SDL's (WideGpuGLCreateShared, set by the
 // frontend once SDL's context exists); only the widescreen worker made first does this. Its
@@ -256,7 +256,7 @@ extern void (*WideGpuGLRelease)();
 // its left or right end (MergedFillWideHoles), or after WideZcReadBack.
 extern bool (*WideGpuGLCreateShared)(std::string& info);
 extern std::atomic<bool> WideZcWantPixels;
-bool WideZcWanted();  // SSR_WIDE_ZEROCOPY=1
+bool WideZcWanted();  // unless SSR_WIDE_ZEROCOPY=0
 bool WideZcActive();  // a worker draws into the frontend's textures
 // The frontend's texture (its OpenGL name, valid in the shared contexts) for slot's next pictures.
 void WideZcOffer(int slot, unsigned tex, int w, int h);

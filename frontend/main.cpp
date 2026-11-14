@@ -119,7 +119,7 @@
 #include "GPU3D_WideGpu.h"
 #include "widezc.h"
 #if defined(__ANDROID__) && defined(SSR_GPU3D)
-// SSR_WIDE_ZEROCOPY=1: the widescreen world handed to SDL without copies (widezc.h); set up once
+// Zero copy (Android, unless SSR_WIDE_ZEROCOPY=0): the widescreen world handed to SDL without copies (widezc.h); set up once
 // SDL's renderer exists, nullptr otherwise.
 static WideZeroCopy* WideZc = nullptr;
 #endif

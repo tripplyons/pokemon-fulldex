@@ -147,8 +147,9 @@ public:
         // (SSR_WIDEGPU_ATTR8=1: the depth and fog flag in an RGB10_A2UI target, 4 bytes a pixel,
         // instead of RG32UI, 8: less tile memory a pixel on a tiled graphics chip, and half the
         // bytes written out and read back by the final pass. The same values: wide_fsh.glsl.)
-        static const bool attr8 = getenv("SSR_WIDEGPU_ATTR8") && !strcmp(getenv("SSR_WIDEGPU_ATTR8"), "1");
-        AttrPacked = attr8;
+        // On by default with OpenGL ES (a phone); SSR_WIDEGPU_ATTR8=0 or 1 chooses.
+        static const char* attr8Env = getenv("SSR_WIDEGPU_ATTR8");
+        AttrPacked = attr8Env ? attr8Env[0] == '1' : IsES;
         if (AttrPacked)
         {
             fsh = Variant(fsh, "WIDE_ATTR_PACKED");
@@ -938,7 +939,9 @@ std::unique_ptr<WideGpuBackend> WideGpuMakeGL(std::string& info)
 // SSR_WIDE_ZEROCOPY (GPU3D_WideGpu.h): what the frontend's thread calls.
 bool WideZcWanted()
 {
-    static const bool on = getenv("SSR_WIDE_ZEROCOPY") && getenv("SSR_WIDE_ZEROCOPY")[0] == '1';
+    // (On by default: emulate 10.5 -> 8.7 ms and compose 2.5 -> 0.8 ms a 720-line frame on an
+    // Adreno 610. SSR_WIDE_ZEROCOPY=0: the readback.)
+    static const bool on = !getenv("SSR_WIDE_ZEROCOPY") || getenv("SSR_WIDE_ZEROCOPY")[0] != '0';
     return on;
 }
 
