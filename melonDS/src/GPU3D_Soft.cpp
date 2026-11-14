@@ -24,6 +24,7 @@
 #include <string.h>
 #include "NDS.h"
 #include "GPU.h"
+#include "GPU3D_WideGpu.h"
 
 extern bool rc_3d_render_skip; // ssrecomp: GPU.cpp
 #if defined(__ANDROID__) && defined(OGLRENDERER_ENABLED)
@@ -1761,6 +1762,17 @@ void SoftRenderer::RenderFrame(GPU& gpu)
 
     bool textureChanged = gpu.MakeVRAMFlat_TextureCoherent(textureDirty);
     bool texPalChanged = gpu.MakeVRAMFlat_TexPalCoherent(texPalDirty);
+    {
+        // ssrecomp: the texture memory's versions, for the widescreen world's decoded textures
+        // on the graphics chip (GPU3D_WideGpu.h, WideGpuAtlas), as WideGpuDSRenderer keeps them.
+        static u64 version = 0;
+        if (textureChanged || texPalChanged || !version)
+        {
+            version++;
+            WideGpuNoteChanges(version, textureDirty.Data, texPalDirty.Data);
+        }
+        WideGpuTexVersion = version;
+    }
 
     FrameIdentical = !(textureChanged || texPalChanged) && gpu.GPU3D.RenderFrameIdentical;
     {

@@ -113,7 +113,7 @@ if [ ! -f "$DEPS/$SDL_NAME/CMakeLists.txt" ]; then
     say "$SDL_NAME's source"
     mkdir -p "$DEPS"
     curl -fsSL -o "$DEPS/$SDL_NAME.tar.gz" "$SDL_URL"
-    echo "$SDL_SHA256  $DEPS/$SDL_NAME.tar.gz" | sha256sum -c --quiet ||
+    [ "$(shasum -a 256 "$DEPS/$SDL_NAME.tar.gz" | cut -d' ' -f1)" = "$SDL_SHA256" ] ||
         fail "SDL2's source does not match its checksum: $DEPS/$SDL_NAME.tar.gz"
     tar -xzf "$DEPS/$SDL_NAME.tar.gz" -C "$DEPS"
 fi
@@ -124,7 +124,11 @@ ONLINE=()
 [ "${SSR_POKEMON_HUB:-}" = ON ] && ONLINE+=(-DSSR_POKEMON_HUB=ON)
 [ -n "${FULLDEX_RELAY_URL:-}" ] && ONLINE+=(-DFULLDEX_RELAY_URL="$FULLDEX_RELAY_URL")
 [ -n "${FULLDEX_GOOGLE_CLIENT_FILE:-}" ] && ONLINE+=(-DFULLDEX_GOOGLE_CLIENT_FILE="$FULLDEX_GOOGLE_CLIENT_FILE")
-STRIP="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+case "$(uname -s)" in
+    Darwin) NDK_HOST=darwin-x86_64 ;; # (a universal build: Apple silicon too)
+    *) NDK_HOST=linux-x86_64 ;;
+esac
+STRIP="$NDK/toolchains/llvm/prebuilt/$NDK_HOST/bin/llvm-strip"
 FILES=()
 for abi in $ABIS; do
     ARGS=(-G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake"

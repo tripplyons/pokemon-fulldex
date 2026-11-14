@@ -629,6 +629,24 @@ void WideGpuBuild(const GPU& gpu, Polygon* const* list, u32 count, int W, int H,
         return format == 0 || ((format == 2 || format == 3 || format == 4) && !(poly->TexParam & (1u << 29)));
     };
 
+    // (SSR_WIDEGPU_SAFEEARLY=1) Whether the shader can discard any of a translucent polygon's
+    // pixels in its translucent pass (wide_fsh.glsl, uDraw.y 2). Its discards there: alpha at or
+    // below the alpha test's reference, and alpha 31. Not when its alpha is 1 to 30 and above the
+    // reference, and every pixel's alpha is the polygon's: untextured; decal (alpha is the
+    // polygon's whatever the texel); or modulate, toon or highlight with every texel's alpha 31
+    // ((31 + 1) * (a + 1) - 1 >> 5 is a): 4, 16 or 256 colours with colour 0 not transparent.
+    // Such a polygon is then tested early with nothing lost: no pixel of it is discarded after
+    // the stencil has its ID (see SSR_WIDEGPU_EARLYTRANS below).
+    static const bool safeEarly = getenv("SSR_WIDEGPU_SAFEEARLY") && !strcmp(getenv("SSR_WIDEGPU_SAFEEARLY"), "1");
+    auto translucentNeverDiscards = [&](const Polygon* poly) {
+        const u32 polyAlpha = (poly->Attr >> 16) & 31;
+        if (polyAlpha == 0 || polyAlpha == 31 || polyAlpha <= g.RenderAlphaRef) return false;
+        const u32 format = texturing ? (poly->TexParam >> 26) & 7 : 0;
+        if (format == 0) return true;
+        if (((poly->Attr >> 4) & 3) == 1) return true; // decal
+        return (format == 2 || format == 3 || format == 4) && !(poly->TexParam & (1u << 29));
+    };
+
     // The opaque polygons, in the game's order, in as few draws as runs of them alike: those
     // whose pixels are never discarded tested early (see WideGpuDraw::Early).
     {
@@ -682,6 +700,7 @@ void WideGpuBuild(const GPU& gpu, Polygon* const* list, u32 count, int W, int H,
     Kind group {};
     u32 groupFirst = 0;
     bool open = false;
+    bool groupSafe = false; // every polygon of the group translucentNeverDiscards
     auto close = [&]() {
         if (!open) return;
         open = false;
@@ -712,7 +731,7 @@ void WideGpuBuild(const GPU& gpu, Polygon* const* list, u32 count, int W, int H,
             // later translucent polygon of the same ID from blending there. A battle's grass
             // tufts at the platform's edge came out wrong, so it is off.)
             static const bool earlyTrans = getenv("SSR_WIDEGPU_EARLYTRANS") && !strcmp(getenv("SSR_WIDEGPU_EARLYTRANS"), "1");
-            d.Early = earlyTrans && !group.WriteDepth;
+            d.Early = (earlyTrans && !group.WriteDepth) || (safeEarly && groupSafe);
             d.DepthWrite = group.WriteDepth;
             d.WriteDepthAttr = group.WriteDepth;
             // A translucent pixel keeps the fog only if the polygon has it too (GPU3D_Wide.cpp's
@@ -767,7 +786,9 @@ void WideGpuBuild(const GPU& gpu, Polygon* const* list, u32 count, int W, int H,
             group = kind;
             groupFirst = (u32)f.Vertices.size();
             open = true;
+            groupSafe = safeEarly;
         }
+        if (groupSafe && !translucentNeverDiscards(poly)) groupSafe = false;
         add(poly);
         if (mixed) close();
     }

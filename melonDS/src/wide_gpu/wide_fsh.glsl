@@ -31,10 +31,12 @@ layout (binding = 2) uniform usamplerBuffer uPal16; // the palette memory, 16 bi
 // a texel, a polygon's texture from the texel its texPalette names (flags bit 2).
 layout (binding = 3) uniform usamplerBuffer uAtlas;
 #else
+#ifndef WIDE_ES
 layout (std430, binding = 1) readonly buffer Polygons
 {
     WidePolygon polys[];
 };
+#endif
 layout (std430, binding = 2) readonly buffer TexMem
 {
     uint texMem[]; // 512 KB
@@ -75,7 +77,14 @@ noperspective in float vZLinear;
 in float vZPersp;
 
 layout (location = 0) out vec4 oColor;
+#ifdef WIDE_ATTR_PACKED
+// (SSR_WIDEGPU_ATTR8=1, GPU3D_WideGpu_GL.cpp: the second target is RGB10_A2UI, 4 bytes a pixel
+// rather than RG32UI's 8: the depth's low 30 bits in red, green and blue, 10 bits each, the
+// fog flag in alpha. The depth is at most a little over 0xFFFFFF, so nothing is lost.)
+layout (location = 1) out uvec4 oAttr;
+#else
 layout (location = 1) out uvec2 oAttr;
+#endif
 
 #ifdef WIDE_TEXBUF
 uint Tex8(uint addr)
@@ -239,7 +248,7 @@ uint ToonEntry(uint i)
 
 void main()
 {
-#ifdef WIDE_TEXBUF
+#if defined(WIDE_TEXBUF) || defined(WIDE_ES)
     WidePolygon poly = WidePolygon(vPolyData.x, vPolyData.y, vPolyData.z, vPolyData.w);
 #else
     WidePolygon poly = polys[vPoly];
@@ -315,5 +324,10 @@ void main()
 #else
     int z = (poly.flags & 1u) != 0u ? int(vZPersp) : int(vZLinear);
 #endif
+#ifdef WIDE_ATTR_PACKED
+    uint uz = uint(max(z, 0));
+    oAttr = uvec4(uz & 0x3FFu, (uz >> 10) & 0x3FFu, (uz >> 20) & 0x3FFu, (attr >> 15) & 1u);
+#else
     oAttr = uvec2(uint(max(z, 0)), (attr >> 15) & 1u);
+#endif
 }

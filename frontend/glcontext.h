@@ -21,3 +21,11 @@ void SsrReleaseGLContext();
 void SsrSetSdlContext(void* window, void* context);
 // An OpenGL function the bundled loader does not have (eglGetProcAddress).
 void* SsrGLGetProc(const char* name);
+
+#ifdef __ANDROID__
+// SSR_WIDE_ZEROCOPY (frontend/widezc.h): SDL's EGL display and context, taken from the calling
+// thread, where SDL's renderer has just made its context current. False if there is none.
+bool SsrShareWithSdl();
+// SsrCreateGLContext, with a context that shares its textures and fences with SDL's.
+bool SsrCreateGLContextShared(std::string& info);
+#endif

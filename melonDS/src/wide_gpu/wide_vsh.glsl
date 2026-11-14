@@ -37,6 +37,10 @@ layout (std430, binding = 1) readonly buffer Polygons
 {
     WidePolygon polys[];
 };
+#else
+// (No storage buffers in a phone's vertex shader: the same polygons as a buffer texture, so that
+// each polygon is read once a vertex and not once a pixel.)
+layout (binding = 4) uniform highp usamplerBuffer uPolys;
 #endif
 
 layout (std140, binding = 0) uniform Frame
@@ -61,8 +65,7 @@ layout (std140, binding = 1) uniform Draw
 #endif
 
 flat out uint vPoly;
-// The polygon's attributes, for wide_fsh.glsl's WIDE_TEXBUF variant (read once a vertex, not
-// once a pixel).
+// The polygon's attributes, for wide_fsh.glsl (read once a vertex, not once a pixel).
 flat out uvec4 vPolyData;
 out vec3 vColor;
 out vec2 vTex;
@@ -101,7 +104,7 @@ void main()
     gl_Position = vec4(ndc * v.w, d * v.w, v.w);
     vPoly = v.poly;
 #ifdef WIDE_ES
-    vPolyData = uvec4(0u); // (wide_fsh.glsl reads the polygon itself there)
+    vPolyData = texelFetch(uPolys, int(v.poly));
 #else
     WidePolygon p = polys[v.poly];
     vPolyData = uvec4(p.attr, p.texParam, p.texPalette, p.flags);

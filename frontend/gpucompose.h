@@ -5,9 +5,37 @@
 #pragma once
 
 #include <chrono>
+#include <cstdio>
 #include <vector>
 #include <SDL.h>
 #include "merged.h"
+
+// The pixels of a texture of the renderer's (made with SDL_TEXTUREACCESS_TARGET) into out, as
+// ARGB8888 rows from the top. (SSR_WIDE_ZEROCOPY, widezc.h: the world's picture where only its
+// texture holds it and the processor needs it after all.)
+inline bool GpuReadTexture(SDL_Renderer* r, SDL_Texture* t, uint32_t* out, int w, int h)
+{
+    SDL_Texture* prev = SDL_GetRenderTarget(r);
+    if (SDL_SetRenderTarget(r, t) != 0) return false;
+    const SDL_Rect all = { 0, 0, w, h };
+    const bool ok = SDL_RenderReadPixels(r, &all, SDL_PIXELFORMAT_ARGB8888, out, w * 4) == 0;
+    SDL_SetRenderTarget(r, prev);
+    return ok;
+}
+
+// Whether the first piece of a wide scene (the top screen, over the world) has any backdrop
+// pixel: where it does, MergedWideCovers reads the world's picture under it.
+inline bool GpuTopHasBackdrop(const Scene& scene, const ScreenImage* screens)
+{
+    if (scene.items.empty()) return false;
+    const Element& el = scene.items[0];
+    if (el.screen < 0 || el.screen > 1 || !screens[el.screen].flags) return false;
+    const uint8_t* f = screens[el.screen].flags;
+    for (int y = std::max(0, el.sy); y < el.sy + el.sh && y < 192; y++)
+        for (int x = std::max(0, el.sx); x < el.sx + el.sw && x < 256; x++)
+            if (LayerClass(f[y * 256 + x]) == LAYER_BACKDROP) return true;
+    return false;
+}
 
 class GpuCompositor
 {
@@ -26,6 +54,23 @@ public:
         if (scene.bgScreen >= 0) bg = screens[scene.bgScreen].pixels[scene.bgY * 256 + scene.bgX] & 0xFFFFFF;
         const bool useWide = scene.wide && !scene.narrow && wide && wide->pixels && wide->w > 0 && wide->h > 0;
         const MergedView v = MergedMakeView(outW, outH);
+        // (SSR_WIDE_ZEROCOPY: the world's picture only in its texture. The piece over the world
+        // leaves out its backdrop where the world has something, MergedWideCovers, which reads
+        // the picture: read back first when that piece has any backdrop. The frontend does this
+        // before the frame is drawn, widezc.h; this is in case it did not.)
+        WideImage zcWide;
+        if (useWide && wide->zcTex && wide->zcStale && !wide->placed && GpuTopHasBackdrop(scene, screens))
+        {
+            zcWide = *wide;
+            zcWide.zcStale = false;
+            if (!GpuReadTexture(R, static_cast<SDL_Texture*>(wide->zcTex), const_cast<uint32_t*>(wide->pixels), wide->w, wide->h))
+            {
+                static int reported = 0;
+                if (reported++ < 5) fprintf(stderr, "[wide] zero copy: the picture could not be read back: %s\n", SDL_GetError());
+            }
+            wide = &zcWide;
+            WideReadBacks++;
+        }
 
         SDL_SetRenderDrawBlendMode(R, SDL_BLENDMODE_NONE);
         SDL_SetRenderDrawColor(R, useWide ? 0 : (bg >> 16) & 0xFF, useWide ? 0 : (bg >> 8) & 0xFF, useWide ? 0 : bg & 0xFF, 255);
@@ -262,17 +307,32 @@ private:
     void DrawWide(const Scene& scene, const ScreenImage screens[2], int outW, int outH, const MergedView& v, bool smooth,
         const WideImage& wide)
     {
-        SDL_Texture* tex = Make(WideTex, wide.w, wide.h);
-        if (!tex) return;
-        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
-        SDL_SetTextureScaleMode(tex, smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
         const auto t0 = std::chrono::steady_clock::now();
-        const uint32_t* px = wide.placed ? wide.pixels
+        // (zcStale: every row has something drawn at both ends, so there is nothing to fill.)
+        const uint32_t* px = wide.placed || wide.zcStale ? wide.pixels
             : MergedFillWideHoles(wide, (int)std::floor(MergedWideX(v.originX, wide.w, outW, outH)),
                   (int)std::ceil(MergedWideX(v.originX + 256 * v.unit, wide.w, outW, outH)), WideFilled);
-        SDL_UpdateTexture(tex, nullptr, px, wide.w * 4);
+        SDL_Texture* tex = nullptr;
+        if (wide.zcTex && !wide.placed && px == wide.pixels)
+        {
+            // (SSR_WIDE_ZEROCOPY: drawn by the graphics chip into this texture, nothing to upload.
+            // Bound once by hand and let go of, so that SDL binds it again for its draw: what
+            // another context drew into a texture is seen where it is bound after that finished.)
+            tex = static_cast<SDL_Texture*>(wide.zcTex);
+            SDL_GL_BindTexture(tex, nullptr, nullptr);
+            SDL_GL_UnbindTexture(tex);
+            WideZeroCopies++;
+        }
+        else
+        {
+            tex = Make(WideTex, wide.w, wide.h);
+            if (!tex) return;
+            SDL_UpdateTexture(tex, nullptr, px, wide.w * 4);
+            WideUploads++;
+        }
+        SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+        SDL_SetTextureScaleMode(tex, smooth ? SDL_ScaleModeLinear : SDL_ScaleModeNearest);
         WideUploadMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-        WideUploads++;
         if (wide.placed)
         {
             // The widened top screen, at its place in the view.
@@ -551,6 +611,9 @@ public:
     // Time spent handing the widescreen picture to the renderer (for the frontend's timing line).
     double WideUploadMs = 0;
     unsigned WideUploads = 0;
+    // (SSR_WIDE_ZEROCOPY: pictures drawn from the graphics chip's texture without an upload, and
+    // read back here for the piece over the world.)
+    unsigned WideZeroCopies = 0, WideReadBacks = 0;
     // (For SSR_EMU_PROF: the pieces' signatures, the piece under the world, the other pieces
     // that were uploaded, and how many were.)
     double SignatureMs = 0, UnderWorldMs = 0, UploadMs = 0;

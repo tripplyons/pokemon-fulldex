@@ -3,7 +3,9 @@
 // frame before at the same time (the pipeline in main.cpp): putting a frame together on the
 // graphics card and presenting it took about 5 ms of each frame on the Switch, on the same
 // core as the emulation. On the Switch the emulation thread has core 0 to itself (the main
-// thread moves to core 2) and a stack as big as the main thread's.
+// thread moves to core 2) and a stack as big as the main thread's. On Android it keeps to the
+// fast cores (fast_cores.h).
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <functional>
@@ -11,6 +13,9 @@
 #include <thread>
 #ifdef __SWITCH__
 #include "switch_platform.h"
+#endif
+#ifdef __ANDROID__
+#include "fast_cores.h"
 #endif
 
 class EmuThread
@@ -87,10 +92,18 @@ public:
     }
 
     bool IsRunning() const { return Running; }
+#ifdef __ANDROID__
+    // The thread's id, once it has started (0 before).
+    int ThreadId() const { return Tid; }
+#endif
 
 private:
     void Loop()
     {
+#ifdef __ANDROID__
+        FastCores::KeepThisThread("emulation thread");
+        Tid = (int)gettid();
+#endif
         std::unique_lock<std::mutex> lock(M);
         for (;;)
         {
@@ -113,4 +126,7 @@ private:
     std::mutex M;
     std::condition_variable CV;
     bool Pending = false, Quit = false, Running = false;
+#ifdef __ANDROID__
+    std::atomic<int> Tid { 0 };
+#endif
 };

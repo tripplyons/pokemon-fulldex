@@ -16,6 +16,7 @@
 #include <string>
 #include <chrono>
 #include <thread>
+#include <atomic>
 #include "sampler.h"
 #include "../gba/frontend/fast_forward_button.h"
 #include "ssr_os.h"
@@ -116,6 +117,12 @@
 #include "recomp_api.h"
 #include "GPU3D_Wide.h"
 #include "GPU3D_WideGpu.h"
+#include "widezc.h"
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+// SSR_WIDE_ZEROCOPY=1: the widescreen world handed to SDL without copies (widezc.h); set up once
+// SDL's renderer exists, nullptr otherwise.
+static WideZeroCopy* WideZc = nullptr;
+#endif
 #include "SsrThreads.h"
 #include "SsrProf.h"
 #include "switch_platform.h"
@@ -563,14 +570,14 @@ static std::vector<uint8_t> ReadFile(const std::string& path)
     return data;
 }
 
-static bool FlushSave(const std::string& path)
+// Writes data as the save at path: to a temporary file first, put in its place once complete.
+static bool WriteSaveFile(const std::string& path, const std::vector<uint8_t>& data)
 {
-    if (!Host::SaveIsDirty) return true;
     if (path.empty()) return false;
     std::string tmp = path + ".tmp";
     FILE* f = fopen(tmp.c_str(), "wb");
     if (!f) { fprintf(stderr, "cannot open save temporary file %s\n", tmp.c_str()); return false; }
-    bool ok = fwrite(Host::SaveData.data(), 1, Host::SaveData.size(), f) == Host::SaveData.size();
+    bool ok = fwrite(data.data(), 1, data.size(), f) == data.size();
     // A completed stdio write alone does not ask Linux to persist the data to storage.
 #if defined(__linux__)
     if (ok) ok = fflush(f) == 0;
@@ -612,8 +619,69 @@ static bool FlushSave(const std::string& path)
     if (synced) { synced = fsync(dir) == 0; if (close(dir) != 0) synced = false; }
     if (!synced) { fprintf(stderr, "cannot sync save directory %s\n", parent.c_str()); return false; }
 #endif
-    fprintf(stderr, "[save] persisted %zu bytes to %s\n", Host::SaveData.size(), path.c_str());
+    fprintf(stderr, "[save] persisted %zu bytes to %s\n", data.size(), path.c_str());
     fflush(stderr);
+    return true;
+}
+
+// The save written while the game goes on, on a thread of its own. Writing it on the frame's
+// thread held that frame up for as long as the storage took to persist it: on a Mangmi Air X
+// (Android's shared storage, fsync of the file and its folder) the frames around each of the
+// game's saves were 90 to 250 ms late, where the others were within 31 ms. Started between
+// frames with a copy of the save; a write that fails leaves the save to be written again.
+// Not on the Switch, whose file system and threads are left as they were.
+struct SaveWriter
+{
+    // Starts writing the save as it is now; nothing if a write is still going.
+    void Start(const std::string& path)
+    {
+        if (Busy) return;
+        Data = Host::SaveData;
+        Host::SaveIsDirty = false;
+        Done = false;
+        Busy = true;
+        T = std::thread([this, path] {
+            Ok = WriteSaveFile(path, Data);
+            Done = true;
+        });
+    }
+    // Whether a write has ended since the last call, without waiting; whether it worked in ok.
+    bool Collect(bool& ok)
+    {
+        if (!Busy || !Done) return false;
+        End(ok);
+        return true;
+    }
+    // Waits for a write that is still going; whether it worked (true when there was none).
+    bool Wait()
+    {
+        bool ok = true;
+        if (Busy) End(ok);
+        return ok;
+    }
+    ~SaveWriter() { Wait(); }
+
+private:
+    void End(bool& ok)
+    {
+        T.join();
+        Busy = false;
+        ok = Ok;
+        if (!ok) Host::SaveIsDirty = true; // (written again at the next chance)
+    }
+    std::thread T;
+    std::vector<uint8_t> Data;
+    std::atomic<bool> Done { false };
+    bool Ok = true, Busy = false;
+};
+static SaveWriter saveWriter;
+
+// Writes the save now if it has changed, after any write still going on the save writer's thread.
+static bool FlushSave(const std::string& path)
+{
+    saveWriter.Wait();
+    if (!Host::SaveIsDirty) return true;
+    if (!WriteSaveFile(path, Host::SaveData)) return false;
     Host::SaveIsDirty = false;
     return true;
 }
@@ -705,6 +773,7 @@ struct Options
     std::set<uint32_t> traceFuncsAt;     // frames at which to list the functions that just ran
     std::string symbols = "gen/symbols.txt";
     std::string config;          // settings file
+    bool configGiven = false;    // --config given: a headless run reads it too (benchmarks with the app's settings)
     std::string stateLoad;       // snapshot to resume from
     std::string stateSave;       // snapshot to write
     uint32_t stateSaveAt = 0;    // frame at which to write it
@@ -731,7 +800,8 @@ static void Usage()
         "  --save <file>        save file (default: <rom>.sav)\n"
         "  --no-save            never write the save file\n"
         "  --layout <name>      merged | hybrid | side | vertical | top | bottom (default merged)\n"
-        "  --config <file>      settings file (default: ssrecomp.cfg beside the save)\n"
+        "  --config <file>      settings file (default: ssrecomp.cfg beside the save; read by\n"
+        "                       --headless only when given)\n"
         "  --scale <n>          window scale (default 3)\n"
         "  --fullscreen         start in fullscreen (F11 toggles)\n"
         "  --headless           no window or audio; run as fast as possible\n"
@@ -791,7 +861,7 @@ static bool ParseArgs(int argc, char** argv, Options& o)
         if (a == "--save") o.save = next();
         else if (a == "--no-save") o.noSave = true;
         else if (a == "--layout") { o.layout = next(); o.layoutGiven = true; }
-        else if (a == "--config") o.config = next();
+        else if (a == "--config") { o.config = next(); o.configGiven = true; }
         else if (a == "--audio-stats") o.audioStats = true;
         else if (a == "--shot-layers") o.shotLayers = true;
         else if (a == "--count-changes") o.countChanges = true;
@@ -978,10 +1048,12 @@ static void ApplyDSGpu(NDS& nds, bool on)
 // Whether the DS-resolution 3D picture goes to the graphics chip with the widescreen world.
 static bool DSPictureOnGpu(bool headless)
 {
+    if (const char* e = getenv("SSR_DS_GPU")) return e[0] == '1'; // (test: 1 on the graphics chip, 0 the processor)
 #ifdef __SWITCH__
     return true;
 #else
-    return headless;
+    // (SSR_PLAY_RENDER=1: a headless benchmark draws as play does.)
+    return headless && !getenv("SSR_PLAY_RENDER");
 #endif
 }
 static bool StartWideGpu()
@@ -1692,7 +1764,7 @@ struct Settings : OptionalFeatures
     bool jit = true;      // Switch, games that are not recompiled: melonDS's JIT (read at start-up)
     bool fastMem = true;  // ... and its fast memory (also read at start-up)
     bool cgearOff = true; // Black 2: answer its C-Gear question on starting (cgear_start=off|ask)
-    bool pipeline = true; // Switch: show each frame while the next one is emulated (emuthread.h)
+    bool pipeline = true; // Switch and Android: show each frame while the next one is emulated (emuthread.h)
     bool frameAhead = true; // ... and one frame further ahead, shown at even times (`ahead`)
     bool displayPacing = true; // Android: pictures follow the screen's refresh ("display_pacing=0" in the settings file: the DS's own clock, as before)
     // The 3D scene drawn by the graphics chip (melonDS/src/GPU3D_GLThread.h). Off unless asked
@@ -1888,6 +1960,11 @@ struct Settings : OptionalFeatures
         f << "pipeline=" << (pipeline ? 1 : 0) << "\n";
         f << "frame_ahead=" << (frameAhead ? 1 : 0) << "\n";
         if (!displayPacing) f << "display_pacing=0\n"; // (kept only when turned off by hand)
+#endif
+#ifdef __ANDROID__
+        // (Kept only when turned off by hand in the settings file.)
+        if (!pipeline) f << "pipeline=0\n";
+        if (!displayPacing) f << "display_pacing=0\n";
 #endif
     }
 };
@@ -2307,7 +2384,7 @@ int main(int argc, char** argv)
     cfg.wideLines = 720;
 #endif
 #endif
-    if (!opt.headless) cfg.Load(opt.config);
+    if (!opt.headless || opt.configGiven) cfg.Load(opt.config);
     gameMusic.Music = cfg.music;
     gameMusic.Effects = cfg.effects;
     // (Test runs, which read no settings file: MUSIC from the start, or MUSIC off from a frame on.)
@@ -2390,8 +2467,8 @@ int main(int argc, char** argv)
         melonDS::WideGpuGLGetProc = SsrGLGetProc;
 #ifndef __SWITCH__
         // In play its drawing goes on a thread of its own (the headless tests keep everything on
-        // their one thread).
-        melonDS::WideGpuGLThreaded = !opt.headless;
+        // their one thread; SSR_PLAY_RENDER=1 gives a headless benchmark the thread of play).
+        melonDS::WideGpuGLThreaded = !opt.headless || getenv("SSR_PLAY_RENDER");
         melonDS::WideGpuGLRelease = SsrReleaseGLContext;
 #endif
 #endif
@@ -2546,6 +2623,23 @@ int main(int argc, char** argv)
         gameTitle = PcLauncher::GameName();
         if (!gameTitle.empty()) windowTitle = gameTitle.c_str();
 #endif
+#ifdef __ANDROID__
+        // SDL asks EGL for a 16-bit depth buffer by default (SDL_GL_ResetAttributes). Nothing
+        // drawn to the window uses one (the 3D renderers draw into their own framebuffers), and
+        // on a tiled GPU it takes room in tile memory: fewer, larger tiles without it.
+        SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 0);
+        SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 0);
+#ifdef SSR_GPU3D
+        // (SSR_WIDE_ZEROCOPY, widezc.h: SDL's context made OpenGL ES 3, like the widescreen
+        // worker's, which shares its textures. SDL's renderer asks for 2.0 otherwise.)
+        if (melonDS::WideZcWanted())
+        {
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+            SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+        }
+#endif
+#endif
         window = SDL_CreateWindow(windowTitle, SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
             w, h,
             SDL_WINDOW_RESIZABLE |
@@ -2580,6 +2674,13 @@ int main(int argc, char** argv)
             SDL_SetHint(SDL_HINT_RENDER_DRIVER, "direct3d11");
 #else
         if (!getenv("SDL_RENDER_DRIVER")) SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
+#endif
+#ifdef __ANDROID__
+        // Naming the driver turns SDL's command batching off (SDL_render.c, SDL_CreateRenderer):
+        // every SDL_Render* call is then sent to OpenGL at once, each with a glBufferSubData into
+        // one of 8 vertex buffers in turn. Batched, a frame's draws go in a few uploads.
+        // (Safe here: no OpenGL calls are made on SDL's context between SDL's own.)
+        if (!getenv("SDL_RENDER_BATCHING")) SDL_SetHint(SDL_HINT_RENDER_BATCHING, "1");
 #endif
         Uint32 rendererFlags = SDL_RENDERER_ACCELERATED;
 #if defined(__APPLE__)
@@ -2653,6 +2754,25 @@ int main(int argc, char** argv)
 #ifdef SSR_GPU3D
         // (Its OpenGL context, which the 3D on the graphics chip hands back after each turn.)
         if (renderer) SsrSetSdlContext(window, SDL_GL_GetCurrentContext());
+#ifdef __ANDROID__
+        // (SSR_WIDE_ZEROCOPY: the widescreen worker, started before SDL's context existed, is
+        // started again with a context that shares it. SDL's context is current here.)
+        if (renderer && melonDS::WideZcWanted())
+        {
+            SDL_RendererInfo ri {};
+            if (SDL_GetRendererInfo(renderer, &ri) == 0 && ri.name && !strcmp(ri.name, "opengles2") && SsrShareWithSdl())
+            {
+                melonDS::WideGpuGLCreateShared = SsrCreateGLContextShared;
+                WideZc = new WideZeroCopy();
+                if (melonDS::WideGpuCurrent)
+                {
+                    melonDS::WideGpuStop();
+                    StartWideGpu();
+                }
+            }
+            else fprintf(stderr, "[widegpu] zero copy (SSR_WIDE_ZEROCOPY): off, SDL's renderer is not OpenGL ES\n");
+        }
+#endif
 #endif
         if (!renderer)
         {
@@ -7317,11 +7437,16 @@ int main(int argc, char** argv)
 
     // The pipeline: each frame is shown while the next one is emulated on a thread of its
     // own (emuthread.h), so that the time for showing it no longer adds to the emulation's.
-    // On the Switch by default ("pipeline" in the settings), elsewhere with SSR_PIPELINE=1.
-    // A frame then reaches the screen one frame later. Not with the headless tests or
-    // lockstep, nor with screenshots unless SSR_PIPELINE is set.
-#ifdef __SWITCH__
+    // On the Switch and Android by default ("pipeline" in the settings), elsewhere with
+    // SSR_PIPELINE=1. A frame then reaches the screen one frame later. Not with the headless
+    // tests or lockstep, nor with screenshots unless SSR_PIPELINE is set.
+    // (Android: without it a frame's emulation, 7 to 12 ms on a Mangmi Air X, and its drawing
+    // and presenting, 4 to 8 ms, came one after the other, over the 16.7 ms of a frame: in its
+    // game.log, 30 to 100 of 300 frames were shown late. SSR_PIPELINE=0 turns it off there.)
+#if defined(__SWITCH__)
     bool pipelined = cfg.pipeline;
+#elif defined(__ANDROID__)
+    bool pipelined = cfg.pipeline && !(getenv("SSR_PIPELINE") && getenv("SSR_PIPELINE")[0] == '0');
 #else
     bool pipelined = getenv("SSR_PIPELINE") != nullptr;
 #endif
@@ -7456,6 +7581,10 @@ int main(int argc, char** argv)
 #endif
         fprintf(stderr, "[pipeline] %s\n", pipelined ? "on: each frame is shown while the next one is emulated" : "could not start");
     }
+#ifdef __ANDROID__
+    // (This thread draws and presents the frames, and emulates them too without the pipeline.)
+    if (!opt.headless) FastCores::KeepThisThread("main thread");
+#endif
 
     uint64_t lastShownAt = 0, shownGaps = 0, shownGapsLong = 0;
     uint64_t lastPresentRet = 0; // when the last SDL_RenderPresent returned (what a frame-time graph sees)
@@ -7796,6 +7925,9 @@ int main(int argc, char** argv)
             lastShownAt = t;
         }
         SDL_RenderPresent(renderer);
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+        if (WideZc) WideZeroCopy::Presented(j.wide);
+#endif
         if (perfOn)
         {
             const uint64_t r = SDL_GetPerformanceCounter();
@@ -7866,6 +7998,10 @@ int main(int argc, char** argv)
     // Always on on the Switch (cfg.frameAhead, see where the settings are read); a test run's
     // "set frame_ahead=0" or SSR_AHEAD=0 turns it off for comparing.
     bool aheadAllowed = pipelined && !(getenv("SSR_AHEAD") && getenv("SSR_AHEAD")[0] == '0');
+#ifdef __ANDROID__
+    // (Android: not yet tried there, and it adds a frame before a press is seen. SSR_AHEAD=1.)
+    if (!(getenv("SSR_AHEAD") && getenv("SSR_AHEAD")[0] == '1')) aheadAllowed = false;
+#endif
 #ifdef SSR_GPU3D
     if (melonDS::GLThreadRenderer::Current) aheadAllowed = false;
 #endif
@@ -7948,13 +8084,30 @@ int main(int argc, char** argv)
                 char extra[200];
                 snprintf(extra, sizeof(extra), "; waited for 3D %.2f wide %.2f ms (wide lines %d)", w3d, wwide, WideLinesNow);
                 std::string tail = extra;
-                if (gpuCompose && gpuCompose->WideUploads)
+                if (gpuCompose && (gpuCompose->WideUploads || gpuCompose->WideZeroCopies))
                 {
                     snprintf(extra, sizeof(extra), "; of compose, the world picture's upload %.2f ms",
                         gpuCompose->WideUploadMs / perfN);
                     tail += extra;
+                    // (SSR_WIDE_ZEROCOPY: pictures uploaded, drawn from the worker's texture, and
+                    // read back from it, of the frames counted.)
+                    unsigned zcRead = gpuCompose->WideReadBacks;
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+                    if (WideZc)
+                    {
+                        zcRead += WideZc->ReadBacks;
+                        WideZc->ReadBacks = 0;
+                    }
+#endif
+                    if (gpuCompose->WideZeroCopies || zcRead)
+                    {
+                        snprintf(extra, sizeof(extra), " (zero copy: %u uploaded, %u not, %u read back here)", gpuCompose->WideUploads,
+                            gpuCompose->WideZeroCopies, zcRead);
+                        tail += extra;
+                    }
                     gpuCompose->WideUploadMs = 0;
                     gpuCompose->WideUploads = 0;
+                    gpuCompose->WideZeroCopies = gpuCompose->WideReadBacks = 0;
                 }
                 if (gpuCompose && SsrProf::On)
                 {
@@ -9284,6 +9437,9 @@ int main(int argc, char** argv)
                 else
                 {
                     ApplyDSGpu(*nds, false);
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+                    if (WideZc) WideZc->BeforeStop(renderer);
+#endif
                     melonDS::WideGpuStop();
                     if (!WideGpuMarker.empty()) remove(WideGpuMarker.c_str());
                     fprintf(stderr, "[widegpu] off: the processor draws the widescreen world\n");
@@ -9740,6 +9896,13 @@ int main(int argc, char** argv)
             melonDS::Wide.ExtendEdges = funcWatchOn && !pt.on;
             melonDS::Wide.Width = ww;
             melonDS::Wide.Height = wh;
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+            // (SSR_WIDE_ZEROCOPY: textures of this size for the worker, and whether this frame's
+            // picture is wanted in memory: see widezc.h.)
+            if (WideZc)
+                WideZc->Prepare(renderer, ww, wh, scene.edgeFill || speed > 1 || ahead || cpuCompose || !opt.shotDir.empty() ||
+                    opt.logSections, frame);
+#endif
             wideFrames = wantWide ? wideFrames + 1 : 0;
         }
         // Filled in after the frame has run: the renderer hands over its picture then.
@@ -9748,6 +9911,12 @@ int main(int argc, char** argv)
         auto takeWideImage = [&]() {
             wideImage = WideImage();
             battleRenderLater = false;
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+            // (SSR_WIDE_ZEROCOPY: a picture only in its texture, read back here when something
+            // on the processor reads it below or after: see widezc.h.)
+            const bool zcCpu = scene.edgeFill || speed > 1 || ahead || cpuCompose || !opt.shotDir.empty() || opt.logSections;
+            if (WideZc && zcCpu) WideZc->EnsurePixels(renderer, melonDS::Wide.Front, melonDS::Wide.FrontW, melonDS::Wide.FrontH);
+#endif
             // A battle on a wide view: the screen widened (battlewide.h) instead of the bars.
             if (scene.edgeFill && cfg.wide && !opt.noWide)
             {
@@ -9814,6 +9983,9 @@ int main(int argc, char** argv)
                 }
                 wideImage.fadeMode = mode;
                 wideImage.fade = f;
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+                if (WideZc && !zcCpu) WideZc->Attach(wideImage);
+#endif
             }
             if (opt.logSections)
             {
@@ -10294,6 +10466,13 @@ int main(int argc, char** argv)
                 if (pipelined) perfEmu += emuMs;
             }
             got = emuGot;
+#ifdef __ANDROID__
+            {
+                // (The system told how long the emulation took: fast_cores.h.)
+                static FastCores::WorkHint workHint;
+                workHint.Report(emuMs, pipelined ? emuThread.ThreadId() : 0);
+            }
+#endif
             perfDsFrames += emuSpeed;
             if (emuSpeed > 1) ffFrameMs = ffFrameMs > 0 ? ffFrameMs * 0.8 + 0.2 * emuMs / emuSpeed : emuMs / emuSpeed;
             // (Silent while the C-Gear's question is answered unseen.)
@@ -11651,6 +11830,14 @@ int main(int argc, char** argv)
             // emulated (from copies of what that emulation overwrites).
             sceneMark(3);
             if (merged) takeWideImage();
+#if defined(__ANDROID__) && defined(SSR_GPU3D)
+            // (SSR_WIDE_ZEROCOPY: a top screen with backdrop over the world reads the world's
+            // picture under it, MergedWideCovers: read back now, between frames, rather than in
+            // the middle of drawing one.)
+            if (WideZc && wideImage.zcStale && GpuTopHasBackdrop(scene, screenImages) &&
+                WideZc->EnsurePixels(renderer, wideImage.pixels, wideImage.w, wideImage.h))
+                wideImage.zcStale = false;
+#endif
             // (--log-sections: how much of the view's sides the widescreen picture leaves empty,
             // rows with nothing drawn at its left and right edges, in tenths, as it changes.)
             if (opt.logSections && merged && wideImage.pixels && wideImage.w > 0 && wideImage.h > 0)
@@ -11713,11 +11900,23 @@ int main(int argc, char** argv)
             if (!WriteSnapshot(*nds, opt.stateSave, scriptClock)) fprintf(stderr, "snapshot failed\n");
         }
 
+#ifdef __SWITCH__
         const bool cloudDirty = !opt.noSave && frame % 120 == 0 && Host::SaveIsDirty;
         if (!opt.noSave && frame % 120 == 0 && !FlushSave(opt.save))
             say("SAVE FAILED - CHECK DISK SPACE AND SAVE FOLDER");
         // (Cloud saves: the save just written goes up a little later; what happened at the start is said.)
         if (cloudDirty && !Host::SaveIsDirty) CloudAuto::Saved();
+#else
+        // (On the save writer's thread, between frames: the emulation, which changes the save,
+        // is not running now.)
+        if (!opt.noSave && frame % 120 == 0 && Host::SaveIsDirty) saveWriter.Start(opt.save);
+        if (bool saved; saveWriter.Collect(saved))
+        {
+            if (!saved) say("SAVE FAILED - CHECK DISK SPACE AND SAVE FOLDER");
+            // (Cloud saves: the save just written goes up a little later; what happened at the start is said.)
+            else CloudAuto::Saved();
+        }
+#endif
         CloudAuto::Tick();
         if (countPlay && frame && frame % 18000 == 0) PlayTime::Add(playDir, 300); // (every five minutes)
         if (frame == 240 && !cloudNote.empty()) { say(cloudNote); cloudNote.clear(); }

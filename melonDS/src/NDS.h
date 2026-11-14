@@ -564,7 +564,14 @@ public:
     NDS(NDS&&) = delete;
     NDS& operator=(NDS&&) = delete;
 
-    static thread_local NDS* Current;
+    // ssrecomp: the one being run (set by RunFrame), a plain variable rather than melonDS's
+    // thread_local. The JIT's slow memory accesses (I/O, VRAM, every 3D command) read it each
+    // time, and a thread_local is a function call at each use on macOS (_tlv_get_addr: with
+    // the reads themselves 5% of the emulation thread's time in a HeartGold town) and on
+    // Android 7 builds (emulated TLS). This program runs one console at a time (the
+    // fast-forward music's copy, and lockstep's reference, run on the same thread between the
+    // game's frames), so it works the same.
+    static NDS* Current;
 protected:
     explicit NDS(NDSArgs&& args, int type, void* userdata) noexcept;
     virtual u32 GetSavestateConfig();

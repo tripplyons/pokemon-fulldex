@@ -202,6 +202,13 @@ struct WideImage
     // the first piece, which is not drawn.
     bool placed = false;
     int baseX = 0;
+    // Android, SSR_WIDE_ZEROCOPY=1 (widezc.h): the picture is also in this SDL texture, where the
+    // graphics chip drew it (slot zcSlot), so gpucompose.h need not upload it. zcStale: `pixels`
+    // does not hold the picture; only its outermost columns were looked at, and every row has
+    // something drawn at both ends (MergedFillWideHoles then fills nothing).
+    void* zcTex = nullptr;
+    int zcSlot = -1;
+    bool zcStale = false;
 };
 
 struct ScreenImage

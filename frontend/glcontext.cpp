@@ -33,6 +33,13 @@ static EGLContext PrevContext = EGL_NO_CONTEXT;
 static EGLenum PrevApi = EGL_OPENGL_ES_API;
 static SDL_Window* SdlWindow = nullptr;
 static SDL_GLContext SdlContext = nullptr;
+#ifdef __ANDROID__
+// SDL's own EGL display and context (SsrShareWithSdl), and the context the next one made shares
+// its objects with (SsrCreateGLContextShared).
+static EGLDisplay SdlEglDisplay = EGL_NO_DISPLAY;
+static EGLContext SdlEglContext = EGL_NO_CONTEXT;
+static EGLContext ShareNext = EGL_NO_CONTEXT;
+#endif
 
 void* SsrGLGetProc(const char* name)
 {
@@ -105,6 +112,10 @@ bool SsrCreateGLContext(std::string& info)
         display = getPlatformDisplay(EGL_PLATFORM_SURFACELESS_MESA, EGL_DEFAULT_DISPLAY, nullptr);
 #endif
     if (display == EGL_NO_DISPLAY) display = eglGetDisplay(EGL_DEFAULT_DISPLAY);
+#ifdef __ANDROID__
+    // (A context that shares SDL's must be on SDL's display.)
+    if (ShareNext != EGL_NO_CONTEXT) display = SdlEglDisplay;
+#endif
     if (display == EGL_NO_DISPLAY)
     {
         info = "no EGL display";
@@ -155,7 +166,11 @@ bool SsrCreateGLContext(std::string& info)
     std::string tried;
     for (const EGLint* attrs : contextLists)
     {
+#ifdef __ANDROID__
+        context = eglCreateContext(display, config, ShareNext, attrs);
+#else
         context = eglCreateContext(display, config, EGL_NO_CONTEXT, attrs);
+#endif
         if (context != EGL_NO_CONTEXT) break;
         #ifdef __ANDROID__
         tried += EglError(attrs[3] == 2 ? "eglCreateContext(ES 3.2)" : "eglCreateContext(ES 3.1)") + "; ";
@@ -212,3 +227,25 @@ bool SsrCreateGLContext(std::string& info)
     info = std::string(renderer ? renderer : "?") + ", OpenGL " + (version ? version : "?");
     return true;
 }
+
+#ifdef __ANDROID__
+bool SsrShareWithSdl()
+{
+    SdlEglDisplay = eglGetCurrentDisplay();
+    SdlEglContext = eglGetCurrentContext();
+    return SdlEglDisplay != EGL_NO_DISPLAY && SdlEglContext != EGL_NO_CONTEXT;
+}
+
+bool SsrCreateGLContextShared(std::string& info)
+{
+    if (SdlEglContext == EGL_NO_CONTEXT)
+    {
+        info = "SDL's context is not known";
+        return false;
+    }
+    ShareNext = SdlEglContext;
+    const bool ok = SsrCreateGLContext(info);
+    ShareNext = EGL_NO_CONTEXT;
+    return ok;
+}
+#endif

@@ -246,5 +246,35 @@ extern void* (*WideGpuGLGetProc)(const char* name);
 extern bool WideGpuGLThreaded;
 // Set by the frontend: lets go of the context on the calling thread (that thread's end).
 extern void (*WideGpuGLRelease)();
+#ifdef __ANDROID__
+// SSR_WIDE_ZEROCOPY=1 (Android, off by default): the widescreen picture is drawn straight into
+// textures of SDL's renderer, one a slot, instead of being read back and uploaded again
+// (frontend/widezc.h). The worker's context then shares SDL's (WideGpuGLCreateShared, set by the
+// frontend once SDL's context exists); only the widescreen worker made first does this. Its
+// slot's memory (Target) then holds the picture only where a reader on the processor needs it:
+// when the frontend asks for that (WideZcWantPixels), when a row of the picture has nothing at
+// its left or right end (MergedFillWideHoles), or after WideZcReadBack.
+extern bool (*WideGpuGLCreateShared)(std::string& info);
+extern std::atomic<bool> WideZcWantPixels;
+bool WideZcWanted();  // SSR_WIDE_ZEROCOPY=1
+bool WideZcActive();  // a worker draws into the frontend's textures
+// The frontend's texture (its OpenGL name, valid in the shared contexts) for slot's next pictures.
+void WideZcOffer(int slot, unsigned tex, int w, int h);
+struct WideZcPicture
+{
+    int Slot = -1;
+    unsigned Tex = 0;          // the texture the picture is in (0: only in the slot's memory)
+    bool Pixels = true;        // the slot's memory holds it too
+};
+// What the picture whose memory is `pixels` (WideState::Front) is.
+bool WideZcLookup(const u32* pixels, WideZcPicture& out);
+void WideZcMarkPixels(int slot); // the frontend filled the slot's memory from its texture
+bool WideZcInUse(unsigned tex);  // a slot's picture is in tex, or the worker draws into it
+// The name of the 2D texture bound in the calling thread's context.
+unsigned WideZcBoundTexture();
+// After SDL presented a frame drawn from slot's texture, in SDL's context: a fence that the
+// worker waits for before it draws into that texture again.
+void WideZcPresented(int slot);
+#endif
 #endif
 }

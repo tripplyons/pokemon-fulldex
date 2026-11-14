@@ -61,7 +61,13 @@ void main()
     uint a = uint(float(stored) * 32.0 / 255.0 + 0.5) - 1u;
     uint a8 = (a << 3) | (a >> 2);
 
+#ifdef WIDE_ATTR_PACKED
+    // (RGB10_A2UI: the depth in red, green and blue, 10 bits each, the fog flag in alpha.)
+    uvec4 packedAttr = texelFetch(uAttr, p, 0);
+    uvec2 attr = uvec2(packedAttr.r | (packedAttr.g << 10) | (packedAttr.b << 20), packedAttr.a);
+#else
     uvec2 attr = texelFetch(uAttr, p, 0).xy;
+#endif
     if ((uFog.w & 3u) == 3u && attr.y != 0u)
     {
         uint z = attr.x, id, frac;
