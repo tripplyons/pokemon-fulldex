@@ -52,6 +52,7 @@ public:
     {
         uint32_t bg = 0;
         if (scene.bgScreen >= 0) bg = screens[scene.bgScreen].pixels[scene.bgY * 256 + scene.bgX] & 0xFFFFFF;
+        else if (scene.bgColor) bg = scene.bgColor & 0xFFFFFF;
         const bool useWide = scene.wide && !scene.narrow && wide && wide->pixels && wide->w > 0 && wide->h > 0;
         const MergedView v = MergedMakeView(outW, outH);
         // (SSR_WIDE_ZEROCOPY: the world's picture only in its texture. The piece over the world
@@ -154,8 +155,10 @@ public:
             }
             const ScreenImage& src = screens[el.screen];
 
-            const bool nearest = el.crisp || !smooth;
-            const bool keyed = el.keys[0] != 0xFFFFFFFF;
+            const bool nearest = MergedNearest(el, v.unit * el.scale, smooth);
+            // (Sharp pixels at an uneven scale: MergedSharp.)
+            const bool sharp = nearest && MergedSharp(s * el.stretchX, s);
+            const bool keyed = el.keys[0] != 0xFFFFFFFF || el.keyGrey;
             const bool spriteKey = el.dropSpriteCorner > 0 && src.flags;
             const bool plain = !(el.drop && src.flags) && !keyed && !spriteKey && el.alpha == 255 && el.cutX >= 256 && !el.holeCount;
             const int slotIndex = slot++;
@@ -173,7 +176,8 @@ public:
             if (!overWorld && cached.hasSig && cached.sig == sig)
             {
                 SDL_SetTextureBlendMode(tex, plain ? SDL_BLENDMODE_NONE : (!nearest && slotIndex < (int)CachedPremul.size() && CachedPremul[slotIndex]) ? Premultiplied : SDL_BLENDMODE_BLEND);
-                DrawPiece(tex, dst, el);
+                DrawPiece(tex, dst, el, sharp ? slotIndex : -1);
+                if (sharp) DrawCrisp(el, src, dst, slotIndex, keyed);
                 continue;
             }
             cached.hasSig = !overWorld;
@@ -223,7 +227,8 @@ public:
             }
             (overWorld ? UnderWorldMs : UploadMs) += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tu).count();
             Uploads++;
-            DrawPiece(tex, dst, el);
+            DrawPiece(tex, dst, el, sharp ? slotIndex : -1);
+            if (sharp) DrawCrisp(el, src, dst, slotIndex, keyed);
         }
         if (!useWide && scene.edgeFill && !scene.items.empty() && scene.items[0].screen >= 0)
         {
@@ -248,8 +253,94 @@ private:
         return x.t;
     }
 
-    void DrawPiece(SDL_Texture* tex, const SDL_Rect& dst, const Element& el)
+    // TEXT STAYS SHARP (GitHub #183): a piece drawn with MergedSharp's even pixels has its
+    // seams blended, which softened the text of message boxes and menus. Its 2D background
+    // layers (the game's text boxes, menus and windows: they do not move with the camera, so
+    // they cannot shimmer) are drawn again over it with nearest pixels, as before 1.6.
+    void DrawCrisp(const Element& el, const ScreenImage& src, const SDL_Rect& dst, int slotIndex, bool keyed)
     {
+        if (!src.flags || el.alpha != 255) return;
+        if ((int)Crisp.size() <= slotIndex) { Crisp.resize(slotIndex + 1); CrispAny.resize(slotIndex + 1, 0); }
+        Tex& x = Crisp[slotIndex];
+        SDL_Texture* t = Make(x, el.sw, el.sh);
+        if (!t) return;
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&h](uint64_t v) { h = (h ^ v) * 1099511628211ull; };
+        mix((uint64_t)(el.screen + 1) << 48 | (uint64_t)el.sx << 32 | (uint64_t)el.sy << 16 | (uint64_t)el.sw);
+        mix((uint64_t)el.sh << 32 | (uint64_t)el.drop << 16 | (keyed ? 1u : 0u));
+        for (uint32_t k : el.keys) mix(k);
+        for (int y = 0; y < el.sh; y++)
+        {
+            const uint32_t* row = src.pixels + (el.sy + y) * 256 + el.sx;
+            const uint8_t* f = src.flags + (el.sy + y) * 256 + el.sx;
+            for (int i = 0; i < el.sw; i++) mix((uint64_t)f[i] << 32 | row[i]);
+        }
+        if (!x.hasSig || x.sig != h)
+        {
+            x.hasSig = true;
+            x.sig = h;
+            CrispBuf.assign((size_t)el.sw * el.sh, 0);
+            bool any = false;
+            for (int y = 0; y < el.sh; y++)
+                for (int i = 0; i < el.sw; i++)
+                {
+                    const int sx = el.sx + i, sy = el.sy + y;
+                    const uint8_t lc = LayerClass(src.flags[sy * 256 + sx]);
+                    if (lc < 1 || lc > 0x0F || (el.drop & lc) || el.Skips(sx, sy)) continue;
+                    const uint32_t c = src.pixels[sy * 256 + sx] & 0xFFFFFF;
+                    if (keyed && MergedKeyed(el, c) &&
+                        (!el.keyRing || std::min({ i, el.sw - 1 - i, y, el.sh - 1 - y }) < el.keyRing))
+                        continue;
+                    CrispBuf[(size_t)y * el.sw + i] = 0xFF000000 | c;
+                    any = true;
+                }
+            SDL_UpdateTexture(t, nullptr, CrispBuf.data(), el.sw * 4);
+            CrispAny[slotIndex] = any;
+        }
+        if (!CrispAny[slotIndex]) return;
+        SDL_SetTextureScaleMode(t, SDL_ScaleModeNearest);
+        SDL_SetTextureBlendMode(t, SDL_BLENDMODE_BLEND);
+        if (el.flipX || el.flipY)
+            SDL_RenderCopyEx(R, t, nullptr, &dst, 0.0, nullptr,
+                (SDL_RendererFlip)((el.flipX ? SDL_FLIP_HORIZONTAL : 0) | (el.flipY ? SDL_FLIP_VERTICAL : 0)));
+        else
+            SDL_RenderCopy(R, t, nullptr, &dst);
+    }
+
+    void DrawPiece(SDL_Texture* tex, const SDL_Rect& dst, const Element& el, int sharpSlot = -1)
+    {
+        // SHARP PIXELS AT AN UNEVEN SCALE (MergedSharp): the piece is first blown up a whole
+        // number of times with nearest pixels, into a texture of its own, and that is drawn
+        // filtered to its place, so that only the seams between pixels are blended.
+        if (sharpSlot >= 0 && SDL_RenderTargetSupported(R))
+        {
+            int tw = 0, th = 0;
+            SDL_QueryTexture(tex, nullptr, nullptr, &tw, &th);
+            const int k = std::clamp((int)std::ceil(std::max((float)dst.w / tw, (float)dst.h / th)), 1, 8);
+            if ((int)Sharp.size() <= sharpSlot) Sharp.resize(sharpSlot + 1);
+            Tex& x = Sharp[sharpSlot];
+            if (!x.t || x.w != tw * k || x.h != th * k)
+            {
+                if (x.t) SDL_DestroyTexture(x.t);
+                x.t = SDL_CreateTexture(R, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, tw * k, th * k);
+                x.w = tw * k;
+                x.h = th * k;
+            }
+            SDL_BlendMode mode = SDL_BLENDMODE_BLEND;
+            SDL_GetTextureBlendMode(tex, &mode);
+            SDL_Texture* was = SDL_GetRenderTarget(R);
+            if (x.t && SDL_SetRenderTarget(R, x.t) == 0)
+            {
+                SDL_SetTextureScaleMode(tex, SDL_ScaleModeNearest);
+                SDL_SetTextureBlendMode(tex, SDL_BLENDMODE_NONE);
+                SDL_RenderCopy(R, tex, nullptr, nullptr);
+                SDL_SetTextureBlendMode(tex, mode);
+                SDL_SetRenderTarget(R, was);
+                SDL_SetTextureScaleMode(x.t, SDL_ScaleModeLinear);
+                SDL_SetTextureBlendMode(x.t, mode);
+                tex = x.t;
+            }
+        }
         // (A mirrored piece, as MergedCompose draws it: the message box's closing edge in
         // the battle strip was drawn the wrong way round here, a dark line beside the text.)
         if (el.flipX || el.flipY)
@@ -269,6 +360,7 @@ private:
         mix((uint64_t)el.sh << 32 | (uint64_t)el.alpha << 24 | (uint64_t)el.drop << 16 | (plain ? 1u : 0u) | (nearest ? 2u : 0u));
         for (uint32_t k : el.keys) mix(k);
         mix((uint64_t)el.keyTolerance << 32 | (uint32_t)el.keyRing);
+        mix((uint64_t)(uint32_t)el.keyGrey);
         mix((uint64_t)el.cutX << 32 | (uint32_t)el.cutY);
         mix((uint64_t)el.dropSpriteCorner << 32 | (uint32_t)el.holeCount);
         for (int i = 0; i < el.holeCount; i++)
@@ -623,6 +715,10 @@ private:
     SDL_Renderer* R;
     SDL_BlendMode Premultiplied;
     std::vector<Tex> Slots;
+    std::vector<Tex> Sharp; // (each slot's piece blown up for MergedSharp)
+    std::vector<Tex> Crisp;          // (each sharp slot's 2D layers, nearest: DrawCrisp)
+    std::vector<uint8_t> CrispAny;
+    std::vector<uint32_t> CrispBuf;
     std::vector<bool> CachedPremul; // (each slot's last blend mode, for a texture not uploaded again)
     Tex WideTex, EdgeTex[2], EdgeInTex[2], FillTex[2], CoverTex[2], NarrowTex[2], WeatherTex[2];
     uint32_t Fill[16 * 192];

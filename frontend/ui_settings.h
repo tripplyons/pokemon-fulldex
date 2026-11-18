@@ -40,7 +40,7 @@ inline std::string Shown(const std::string& s, bool title)
 inline std::string Sentence(const std::string& s)
 {
     for (char ch : s) if (ch >= 'a' && ch <= 'z') return s; // (already written in sentence case)
-    static const char* const keep[] = { "FPS", "HD", "HUD", "GBA", "DS", "3D", "2D", "PC", "OK", "A", "B", "X", "Y", "L", "R", "MB", "GPU", "CPU", "JIT", "LCD", "HP", "TM", "HM" };
+    static const char* const keep[] = { "FPS", "HD", "HUD", "GBA", "DS", "3D", "2D", "PC", "OK", "A", "B", "X", "L", "R", "MB", "GPU", "CPU", "JIT", "LCD", "HP", "TM", "HM" };
     std::string out;
     bool start = true;
     size_t i = 0;
@@ -52,11 +52,23 @@ inline std::string Sentence(const std::string& s)
         std::string w = s.substr(i, j - i);
         bool kept = false;
         for (const char* k : keep) if (w == k) kept = true;
+        // (Y: the button in English; in the other languages only next to ":" or "/" (Y:, X / Y), being
+        // otherwise the Spanish "y" (and).)
+        if (w == "Y")
+        {
+            size_t k = j;
+            while (k < s.size() && s[k] == ' ') k++;
+            const size_t b = out.find_last_not_of(' ');
+            kept = UiLang::lang == 0 || (k < s.size() && (s[k] == ':' || s[k] == '/')) || (b != std::string::npos && out[b] == '/');
+        }
+        // (The games' and hacks' names, and plurals of the names kept in capitals, as they are written.)
+        static const char* const names[][2] = { { "RUBY", "Ruby" }, { "SAPPHIRE", "Sapphire" }, { "EMERALD", "Emerald" }, { "FIRERED", "FireRed" },
+                                                 { "LEAFGREEN", "LeafGreen" }, { "ULTRA", "Ultra" }, { "VIOLET", "Violet" }, { "MONOMYTH", "Monomyth" },
+                                                 { "TMS", "TMs" }, { "HMS", "HMs" }, { "IVS", "IVs" }, { "EVS", "EVs" } };
+        for (const auto& nm : names) if (w == nm[0]) w = nm[1], kept = true;
         if (w == "POKEMON") w = "Pok\xC3\xA9" "mon", kept = true;
         else if (w == "POKEDEX") w = "Pok\xC3\xA9" "dex", kept = true;
-        if (!kept)
-            for (size_t k = start ? 1 : 0; k < w.size(); k++)
-                if (w[k] >= 'A' && w[k] <= 'Z') w[k] += 32;
+        if (!kept) UiLang::LowerLatin(w, start ? 1 : 0);
         out += w;
         start = false;
         i = j;
@@ -66,12 +78,14 @@ inline std::string Sentence(const std::string& s)
 inline int PixelScale(int px) { return std::max(1, (px + 4) / 9); }
 inline int W(const std::string& s, int px, bool bold = false, bool title = true)
 {
+    px = UiMinPx(px); // (larger menus: the rows' second lines and values were 6 to 9 pixels)
     if (Menu::UseClean()) return CleanFont::Width(Shown(s, title), px, bold);
     return Canvas::TextWidth(s, PixelScale(px));
 }
 // (y: the baseline.)
 inline void T(Canvas& c, int x, int y, const std::string& s, int px, uint32_t col, bool bold = false, bool title = true)
 {
+    px = UiMinPx(px);
     if (Menu::UseClean()) CleanFont::Draw(c, x, y, Shown(s, title), px, col, bold);
     else c.Text(x, y - 7 * PixelScale(px), s, PixelScale(px), col);
 }
@@ -84,21 +98,45 @@ inline std::vector<std::string> Wrap(const std::string& s, int px, int maxW, siz
 {
     std::vector<std::string> lines;
     std::string line;
-    size_t i = 0;
     const std::string text = UiLang::Tr(s);
-    while (i < text.size())
+    // The pieces a line may break between: words at spaces, and in Japanese and Chinese, which
+    // have no spaces, between characters (but not before a closing mark: 。、）...). Cut at spaces
+    // only, a Japanese answer was one long line running off the panel.
+    struct Unit { std::string t; bool space; };
+    std::vector<Unit> units;
+    auto cjk = [](uint32_t c) { return (c >= 0x2E80 && c <= 0x9FFF) || (c >= 0xF900 && c <= 0xFAFF) || (c >= 0xFF00 && c <= 0xFFEF); };
+    auto noStart = [](uint32_t c) { return c == 0x3001 || c == 0x3002 || c == 0x300D || c == 0x300F || c == 0x30FC || c == 0xFF01 || c == 0xFF09 ||
+                                           c == 0xFF0C || c == 0xFF0E || c == 0xFF1A || c == 0xFF1B || c == 0xFF1F; };
     {
-        size_t j = text.find(' ', i);
-        if (j == std::string::npos) j = text.size();
-        const std::string word = text.substr(i, j - i);
-        const std::string tryLine = line.empty() ? word : line + " " + word;
+        std::string cur;
+        bool space = false, prevCjk = false;
+        for (size_t i = 0; i < text.size();)
+        {
+            const size_t st = i;
+            const uint32_t c = UiLang::Next(text, i);
+            if (c == ' ')
+            {
+                if (!cur.empty()) { units.push_back({ cur, space }); cur.clear(); }
+                space = true;
+                prevCjk = false;
+                continue;
+            }
+            const bool k = cjk(c);
+            if (!cur.empty() && (k || prevCjk) && !noStart(c)) { units.push_back({ cur, space }); cur.clear(); space = false; }
+            cur += text.substr(st, i - st);
+            prevCjk = k;
+        }
+        if (!cur.empty()) units.push_back({ cur, space });
+    }
+    for (const Unit& u : units)
+    {
+        const std::string tryLine = line.empty() ? u.t : line + (u.space ? " " : "") + u.t;
         if (!line.empty() && W(tryLine, px, false, false) > maxW)
         {
             lines.push_back(line);
-            line = word;
+            line = u.t;
         }
         else line = tryLine;
-        i = j + 1;
     }
     if (!line.empty()) lines.push_back(line);
     if (lines.size() > maxLines)
@@ -261,7 +299,7 @@ inline int PromptHit(int x, int y)
 // pressed once), the buttons' hint; canClear: CLEAR BINDING can be chosen.
 inline void Prompt(Canvas& c, int icon, const std::string& title, const std::string& sub, const std::string& warn, const std::string& hint, bool canClear)
 {
-    const float k = std::max(0.42f, std::min(c.w / 1400.0f, c.h / 788.0f));
+    const float k = std::max(0.42f, std::min(c.w / 1400.0f, c.h / 788.0f) * UiScale());
     auto K = [&](float v) { return (int)std::lround(v * k); };
     Glass::Round(c, 0, 0, c.w, c.h, 0, 0x66000000); // (the page dimmed behind it)
     const int pw = std::min(c.w - K(32), K(460)), innerW = pw - K(48);
@@ -761,7 +799,7 @@ inline void Picture(Canvas& c, int kind, int art, int x, int y, int w, int h, fl
         }
         break;
     }
-    case Menu::P_BATTLE: // CORNER, STRIP, PANEL
+    case Menu::P_BATTLE: // CORNER, STRIP, PANEL, (CLASSIC: STRIP's), SUN AND MOON
     {
         Whole(c, Frame(c), x, y, w, h, r);
         static const uint32_t col[] = { 0xF0E2574C, 0xF04C8BE2, 0xF04CC27A, 0xF0E2BE4C };
@@ -778,6 +816,15 @@ inline void Picture(Canvas& c, int kind, int art, int x, int y, int w, int h, fl
             Glass::Round(c, x, by, w, bh, 0, 0xC0101820);
             for (int i = 0; i < 4; i++)
                 Glass::Round(c, x + w * (2 + 23 * i) / 96, by + bh / 5, w * 20 / 96, bh * 3 / 5, bh * 0.25f, col[i]);
+        }
+        else if (art == 3)
+        {
+            // SUN AND MOON: FIGHT across the top, POKEMON, BAG and RUN under it, in the lower right.
+            const int pw = (int)(w * 0.42f), px = x + w - pw - (int)(w * 0.03f), fh = (int)(h * 0.16f), rh = (int)(h * 0.13f);
+            const int gap = std::max(1, (int)(h * 0.02f)), py = y + h - fh - rh - gap - (int)(h * 0.05f), cw = (pw - 2 * gap) / 3;
+            Glass::Round(c, px, py, pw, fh, fh * 0.25f, 0xF0E95245);
+            static const uint32_t row[3] = { 0xF048C783, 0xF0E2B32F, 0xF0509AEA };
+            for (int i = 0; i < 3; i++) Glass::Round(c, px + i * (cw + gap), py + fh + gap, cw, rh, rh * 0.3f, row[i]);
         }
         else
         {
@@ -1013,7 +1060,7 @@ inline int Menu::UpdateSettings(const MenuInput& in, int& dir)
     if (in.down) step(1);
     const MenuItem& it = items[selected];
     if (it.disabled || it.kind == K_SECTION) return -1;
-    if (in.accept) return selected; // (a toggle turns over, a picker steps on, a link or Back opens)
+    if (in.accept) return it.kind == K_PLAIN ? -1 : selected; // (A turns a toggle over and steps a picker on, as before #210; a link or Back opens)
     if (in.left || in.right)
     {
         const int d = in.left ? -1 : 1;
@@ -1064,16 +1111,31 @@ inline void Menu::SettingsTap(int item, int x, MenuInput& input)
     if (item < 0) return;
     selected = item;
     const MenuItem& it = items[item];
-    // (A pill tapped: that one. A picker: its left half back, its right half on. The slot grid:
-    // whatever is tapped is chosen, a toggle turned over.)
+    if (it.disabled) return;
+    if (it.kind == K_BACK) { input.back = true; return; }
+    // (The slot grid and the keyboard: whatever is tapped is chosen.)
     if (slotGrid || keyGrid) { input.accept = true; return; }
-    if (it.kind == K_TOGGLE || it.kind == K_PICKER)
-    {
-        if (x >= ctlX) { if (x < ctlX + ctlW / 2) input.left = true; else input.right = true; }
-        else if (it.kind == K_PICKER) input.right = true;
-        else input.accept = true; // (a toggle's name: turned over)
-    }
-    else input.accept = true;
+    // (The visible controls: Off/On pills, chevrons, preview cards, links. The row's name only
+    // focuses it; the pad reaches the same changes with Left/Right on the focused row.)
+    for (const UiInput::Part& p : parts)
+        if (p.item == item && UiInput::InPart(p, x, pickY))
+        {
+            switch (p.intent)
+            {
+            case UiInput::Intent::Focus: return;
+            case UiInput::Intent::Step:
+                if (p.value < 0) input.left = true; else input.right = true;
+                return;
+            case UiInput::Intent::Set:
+                // (An Off/On pill: 0 is Off, 1 is On. A value of 0 must go left, not right.)
+                if (p.value == 0) input.left = true; else input.right = true;
+                return;
+            case UiInput::Intent::Open: input.accept = true; return;
+            case UiInput::Intent::Back: input.back = true; return;
+            case UiInput::Intent::Drag: return;
+            }
+            return;
+        }
 }
 
 // A type's colour (the games' own, as fans know them), for its chip and a move's edge.
@@ -1102,7 +1164,7 @@ inline int TypeChip(Canvas& c, int type, int x, int y, float k)
 {
     using namespace SettingsArt;
     auto K = [&](float v) { return (int)std::lround(v * k); };
-    const std::string name = CleanFont::Title(CompanionTypes::Name(type));
+    const std::string name = CleanFont::Title(UiLang::Tr(CompanionTypes::Name(type)));
     const int px = K(12), w = W(name, px, true, false) + K(18), h = K(22);
     Glass::Round(c, x, y, w, h, h * 0.5f, TypeColour(type));
     T(c, x + K(9), y + h / 2 + px * 7 / 20, name, px, 0xFFFFFFFF, true, false);
@@ -1123,7 +1185,7 @@ inline void MonSummary(Canvas& c, const Menu::CompanionView::Mon& m, int x0, int
     if (!m.icon.empty()) MonIcon(c, m.icon, m.iconW, m.iconH, x0, y, is);
     else Glass::DrawIcon(c, Glass::I_POKEBALL, x0 + is * 0.5f, y + is * 0.5f, is * 0.28f, GlassText);
     const int tx = x0 + is + K(14);
-    const std::string lv = m.egg ? std::string("Egg") : "Lv " + std::to_string(m.level);
+    const std::string lv = m.egg ? UiLang::Tr("Egg") : "Lv " + std::to_string(m.level);
     if (showName)
     {
         T(c, tx, y + K(24), m.name, K(22), GlassText, true, false);
@@ -1135,10 +1197,10 @@ inline void MonSummary(Canvas& c, const Menu::CompanionView::Mon& m, int x0, int
     if (CompanionTypes::Valid(m.type2) && m.type2 != m.type1) TypeChip(c, m.type2, cx, y + K(34), k);
     y += is + K(14);
     std::string line;
-    if (!m.nature.empty()) line = m.nature + " nature";
+    if (!m.nature.empty()) line = UiLang::F("{0} nature", { m.nature });
     if (!m.ability.empty()) line += (line.empty() ? "" : "  \xC2\xB7  ") + m.ability;
     if (!line.empty()) { T(c, x0, y + K(12), line, K(13), Desc, false, false); y += K(20); }
-    T(c, x0, y + K(12), "Holding " + (m.item.empty() ? std::string("nothing") : m.item), K(13), Desc, false, false);
+    T(c, x0, y + K(12), UiLang::F("Holding {0}", { m.item.empty() ? UiLang::Tr("nothing") : m.item }), K(13), Desc, false, false);
     y += K(26);
     if (m.egg) return;
     // (Stats: each a bar, the longest the highest of the six; its IV after.)
@@ -1237,18 +1299,21 @@ inline void DexSummary(Canvas& c, const Menu::CompanionView::DexEntry& e, int x0
     auto K = [&](float v) { return (int)std::lround(v * k); };
     const uint32_t GlassText = Menu::GlassText, GlassHint = Menu::GlassHint;
     int y = top;
-    const int is = K(64);
+    // (Its battle picture from the ROM when there is one (its own page), else its party icon.)
+    const bool pic = !e.hidden && !e.pic.empty() && e.picW > 0;
+    const int is = pic ? K(96) : K(64);
     Glass::Round(c, x0, y, is, is, 14 * k, 0x400A111C);
     Glass::Rim(c, x0, y, is, is, 14 * k, std::max(1.0f, k), 0x60, 0x14);
-    if (!e.icon.empty()) MonIcon(c, e.icon, 32, 32, x0, y, is, e.hidden ? 0xC0 : e.seen ? 255 : 0x50, e.hidden ? 0xFF05080Du : 0);
+    if (pic) MonIcon(c, e.pic, e.picW, e.picH, x0, y, is);
+    else if (!e.icon.empty()) MonIcon(c, e.icon, 32, 32, x0, y, is, e.hidden ? 0xC0 : e.seen ? 255 : 0x50, e.hidden ? 0xFF05080Du : 0);
     const int tx = x0 + is + K(16);
     char num[16];
     snprintf(num, sizeof num, "No. %03d", e.id);
     T(c, tx, y + K(22), num, K(17), GlassText, true, false);
     // (Caught: a white pill; seen: a glass one; neither: a hint.)
-    const std::string state = e.caught ? "Caught" : e.seen ? "Seen" : "Not seen yet";
+    const std::string state = !e.stateKnown ? "" : e.caught ? "Caught" : e.seen ? "Seen" : "Not seen yet";
     const int sw = W(state, K(14), true, false) + K(20), sh = K(24), sx = x0 + w0 - sw;
-    if (e.seen) { Glass::Round(c, sx, y + K(4), sw, sh, sh * 0.5f, e.caught ? Pill : Row); if (!e.caught) Glass::Rim(c, sx, y + K(4), sw, sh, sh * 0.5f, std::max(1.0f, k), 0x60, 0x14); }
+    if (e.seen && e.stateKnown) { Glass::Round(c, sx, y + K(4), sw, sh, sh * 0.5f, e.caught ? Pill : Row); if (!e.caught) Glass::Rim(c, sx, y + K(4), sw, sh, sh * 0.5f, std::max(1.0f, k), 0x60, 0x14); }
     T(c, sx + K(10), y + K(4) + sh / 2 + K(5), state, K(14), e.caught ? PillInk : e.seen ? GlassText : GlassHint, true, false);
     if (e.hidden)
     {
@@ -1259,7 +1324,15 @@ inline void DexSummary(Canvas& c, const Menu::CompanionView::DexEntry& e, int x0
     }
     int cx = tx;
     if (CompanionTypes::Valid(e.type1)) cx += TypeChip(c, e.type1, cx, y + K(36), k * 1.15f) + K(6);
-    if (CompanionTypes::Valid(e.type2) && e.type2 != e.type1) TypeChip(c, e.type2, cx, y + K(36), k * 1.15f);
+    if (CompanionTypes::Valid(e.type2) && e.type2 != e.type1) cx += TypeChip(c, e.type2, cx, y + K(36), k * 1.15f);
+    // (The shiny one, smaller, at the right under seen or caught, where the type chips leave room.)
+    const int shinyRoom = x0 + w0 - cx - K(10);
+    if (pic && !e.shinyPic.empty() && shinyRoom >= K(40))
+    {
+        const int ss = std::min(K(60), shinyRoom), sx = x0 + w0 - ss, sy = y + K(32);
+        MonIcon(c, e.shinyPic, e.picW, e.picH, sx, sy, ss);
+        T(c, sx + (ss - W("Shiny", K(12), false, false)) / 2, sy + ss + K(8), "Shiny", K(12), GlassHint, false, false);
+    }
     y += is + K(18);
     if (moves)
     {
@@ -1286,7 +1359,7 @@ inline void DexSummary(Canvas& c, const Menu::CompanionView::DexEntry& e, int x0
             T(c, nx, my + rowH / 2 + K(5), name, K(14), GlassText, true, false);
         }
         if (fit < e.learns.size())
-            T(c, x0, y + rows * rowH + K(18), "+" + std::to_string(e.learns.size() - fit) + " more", K(14), GlassHint, true, false);
+            T(c, x0, y + rows * rowH + K(18), UiLang::F("+{0} more", { std::to_string(e.learns.size() - fit) }), K(14), GlassHint, true, false);
         if (e.learns.empty()) T(c, x0, y + K(16), "None", K(16), Desc, false, false);
         T(c, x0, bottom - K(6), "A or tap: back to the entry", K(15), GlassHint, false, false);
         return;
@@ -1301,7 +1374,7 @@ inline void DexSummary(Canvas& c, const Menu::CompanionView::DexEntry& e, int x0
     if (total > 0 && bottom - y > K(110))
     {
         T(c, x0, y + K(14), "Base stats", K(15), GlassHint, true, false);
-        const std::string t = "Total " + std::to_string(total);
+        const std::string t = UiLang::F("Total {0}", { std::to_string(total) });
         T(c, x0 + w0 - W(t, K(15), true, false), y + K(14), t, K(15), GlassText, true, false);
         y += K(24);
         const int gap = K(18), colW = (w0 - gap) / 2, rowH = K(26), labelW = K(62), numW = K(34);
@@ -1324,7 +1397,7 @@ inline void DexSummary(Canvas& c, const Menu::CompanionView::DexEntry& e, int x0
     {
         std::string a;
         for (const auto& ab : e.abilities) a += (a.empty() ? "" : "  \xC2\xB7  ") + ab;
-        lines.push_back((e.abilities.size() > 1 ? "Abilities: " : "Ability: ") + a);
+        lines.push_back(UiLang::F(e.abilities.size() > 1 ? "Abilities: {0}" : "Ability: {0}", { a }));
     }
     for (const auto& ev : e.evolutions) lines.push_back(ev);
     for (const auto& line : lines)
@@ -1335,7 +1408,7 @@ inline void DexSummary(Canvas& c, const Menu::CompanionView::DexEntry& e, int x0
         T(c, x0, y + K(16), l, K(16), Desc, false, false);
         y += K(25);
     }
-    if (bottom - y > K(30))
+    if (bottom - y > K(30) && !e.learns.empty()) // (the GBA games' cards have no moves to switch to)
         T(c, x0, bottom - K(6), "A or tap: the moves it learns", K(15), GlassHint, false, false);
 }
 
@@ -1382,8 +1455,8 @@ inline void BattleFoeSummary(Canvas& c, const Menu::CompanionView::Mon& m, int x
     if (CompanionTypes::Valid(m.type1)) cx += TypeChip(c, m.type1, cx, y + K(44), k * 1.1f) + K(6);
     if (CompanionTypes::Valid(m.type2) && m.type2 != m.type1) TypeChip(c, m.type2, cx, y + K(44), k * 1.1f);
     y += is + K(24);
-    if (!m.ability.empty()) { T(c, x0, y + K(14), "Ability: " + m.ability, K(17), Desc, false, false); y += K(26); }
-    T(c, x0, y + K(14), "Holding " + (m.item.empty() ? std::string("nothing") : m.item), K(17), Desc, false, false);
+    if (!m.ability.empty()) { T(c, x0, y + K(14), UiLang::F("Ability: {0}", { m.ability }), K(17), Desc, false, false); y += K(26); }
+    T(c, x0, y + K(14), UiLang::F("Holding {0}", { m.item.empty() ? UiLang::Tr("nothing") : m.item }), K(17), Desc, false, false);
     y += K(36);
     if (!CompanionTypes::Valid(m.type1)) return;
     // (Each group: a heading, then the types as chips with how strong, wrapping while they fit.)
@@ -1406,7 +1479,7 @@ inline void BattleFoeSummary(Canvas& c, const Menu::CompanionView::Mon& m, int x
         int chx = x0;
         for (const auto& [type, p] : list)
         {
-            const std::string name = CleanFont::Title(CompanionTypes::Name(type)) + (p == 400 ? " 4x" : p == 25 ? " 0.25x" : "");
+            const std::string name = CleanFont::Title(UiLang::Tr(CompanionTypes::Name(type))) + (p == 400 ? " 4x" : p == 25 ? " 0.25x" : "");
             const int px = K(13), cw = W(name, px, true, false) + K(18), chh = K(24);
             if (chx + cw > x0 + w0) { chx = x0; y += chh + K(6); if (y + chh > bottom) break; }
             Glass::Round(c, chx, y, cw, chh, chh * 0.5f, TypeColour(type));
@@ -1440,7 +1513,7 @@ inline void BattleMoveSummary(Canvas& c, const Menu::CompanionView::BattleMove& 
         T(c, x0 + i * colW, y + K(46), vals[i], K(26), i == 2 && mv.pp == 0 ? 0xFFE5534Bu : GlassText, true, false);
     }
     y += K(76);
-    T(c, x0, y + K(14), "Against " + foe, K(15), GlassHint, true, false);
+    T(c, x0, y + K(14), UiLang::F("Against {0}", { foe }), K(15), GlassHint, true, false);
     y += K(26);
     const std::string big = mv.category == 2 ? std::string("Status move") : MatchText(mv.percent);
     T(c, x0, y + K(38), big, K(40), mv.category == 2 ? GlassText : MatchColour(mv.percent), true, false);
@@ -1463,13 +1536,13 @@ inline void CoverageSummary(Canvas& c, const Menu::CompanionView::Mon& m, const 
     Glass::Rim(c, x0, y, is, is, 14 * k, std::max(1.0f, k), 0x60, 0x14);
     if (!m.icon.empty()) MonIcon(c, m.icon, m.iconW, m.iconH, x0, y, is, m.hp == 0 ? 0x70 : 255);
     const int tx = x0 + is + K(16);
-    T(c, tx, y + K(24), "Lv " + std::to_string(m.level) + "  \xC2\xB7  " + (m.hp ? std::to_string(m.hp) + " / " + std::to_string(m.maxHp) + " HP" : std::string("Fainted")), K(16), GlassText, true, false);
+    T(c, tx, y + K(24), "Lv " + std::to_string(m.level) + "  \xC2\xB7  " + (m.hp ? std::to_string(m.hp) + " / " + std::to_string(m.maxHp) + " HP" : UiLang::Tr("Fainted")), K(16), GlassText, true, false);
     int cx = tx;
     if (CompanionTypes::Valid(m.type1)) cx += TypeChip(c, m.type1, cx, y + K(36), k * 1.1f) + K(6);
     if (CompanionTypes::Valid(m.type2) && m.type2 != m.type1) TypeChip(c, m.type2, cx, y + K(36), k * 1.1f);
     y += is + K(26);
     const struct { const char* head; int pct; std::string say; } rows[] = {
-        { "Its best move", cov.out, "against " + foe },
+        { "Its best move", cov.out, UiLang::F("against {0}", { foe }) },
         { "The foe's worst known move", cov.in, "against it" } };
     for (const auto& r : rows)
     {
@@ -1485,7 +1558,7 @@ inline void CoverageSummary(Canvas& c, const Menu::CompanionView::Mon& m, const 
 // COMPANION's pictures of what the game holds now (Menu::CompanionView), in the box x0..x0+w0,
 // top..bottom: a settings page's preview (DrawSettings), the Companion Window and the HUD.
 inline bool CompanionPicture(Canvas& c, const Menu::CompanionView& cv, int kind, int x0, int top, int w0, int bottom, float k,
-                             int chosen = -1, std::vector<std::array<int, 5>>* picks = nullptr)
+                             int chosen = -1, std::vector<std::array<int, 5>>* picks = nullptr, const std::string& title = std::string())
 {
     using namespace SettingsArt;
     const uint32_t GlassText = Menu::GlassText, GlassHint = Menu::GlassHint;
@@ -1529,7 +1602,7 @@ inline bool CompanionPicture(Canvas& c, const Menu::CompanionView& cv, int kind,
             const int tx = ix + is + K(10), tw = cx + cw - K(12) - tx;
             const int nameY = cy + ch / 2 - K(4), barY = cy + ch / 2 + K(6);
             std::string name = m.name;
-            const std::string lv = m.egg ? std::string("Egg") : "Lv " + std::to_string(m.level);
+            const std::string lv = m.egg ? UiLang::Tr("Egg") : "Lv " + std::to_string(m.level);
             while (name.size() > 1 && W(name, K(16), true, false) > tw - W(lv, K(13), false, false) - K(16)) name.pop_back();
             T(c, tx, nameY, name, K(16), GlassText, true, false);
             T(c, cx + cw - K(12) - W(lv, K(13), false, false), nameY, lv, K(13), GlassHint, false, false);
@@ -1562,7 +1635,7 @@ inline bool CompanionPicture(Canvas& c, const Menu::CompanionView& cv, int kind,
             if (!empty || on) Glass::Rim(c, cx, cy, cw, ch, 12 * k, std::max(1.0f, k), on ? 0x90 : 0x60, 0x14);
             if (picks) picks->push_back({ cx, cy, cw, ch, i });
             T(c, cx + K(14), cy + ch / 2 - K(2), pk[i].name, K(15), on ? PillInk : empty ? GlassHint : GlassText, true, false);
-            const std::string sub = empty ? "Empty" : std::to_string(pk[i].stacks) + (pk[i].stacks == 1 ? " kind" : " kinds") + "  \xC2\xB7  " + std::to_string(pk[i].total) + " in all";
+            const std::string sub = empty ? "Empty" : UiLang::F(pk[i].stacks == 1 ? "{0} kind" : "{0} kinds", { std::to_string(pk[i].stacks) }) + "  \xC2\xB7  " + UiLang::F("{0} in all", { std::to_string(pk[i].total) });
             T(c, cx + K(14), cy + ch / 2 + K(16), sub, K(12), on ? 0xB30B1018u : GlassHint, false, false);
         }
     }
@@ -1594,7 +1667,7 @@ inline bool CompanionPicture(Canvas& c, const Menu::CompanionView& cv, int kind,
         {
             const std::string num = std::to_string(l.n);
             T(c, x0, y + K(36), num, K(38), GlassText, true, false);
-            T(c, x0 + W(num, K(38), true, false) + K(12), y + K(36), std::string(l.name) + " of " + std::to_string(total), K(16), Desc, false, false);
+            T(c, x0 + W(num, K(38), true, false) + K(12), y + K(36), UiLang::F("{0} of {1}", { std::string(l.name), std::to_string(total) }), K(16), Desc, false, false);
             const int pct = (int)std::lround(100.0 * l.n / total);
             const std::string ps = std::to_string(pct) + "%";
             T(c, x0 + w0 - W(ps, K(16), true, false), y + K(36), ps, K(16), GlassText, true, false);
@@ -1608,7 +1681,8 @@ inline bool CompanionPicture(Canvas& c, const Menu::CompanionView& cv, int kind,
     {
         // (LOCATION: the place's name, then the region's map from the ROM with the player on it.)
         int y = top;
-        if (!cv.place.empty()) { T(c, x0, y + K(26), cv.place, K(24), GlassText, true, false); y += K(38); }
+        // (Not again when the preview's title already is the place's name.)
+        if (!cv.place.empty() && cv.place != title) { T(c, x0, y + K(26), cv.place, K(24), GlassText, true, false); y += K(38); }
         if (!cv.area.empty()) { T(c, x0, y + K(10), cv.area, K(14), GlassHint, false, false); y += K(22); }
         if (!cv.map.empty() && cv.mapW > 0 && cv.mapH > 0 && bottom - y > K(60))
         {
@@ -1692,29 +1766,38 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
     // press.)
     static std::vector<uint32_t> frame;
     static std::string frameKey;
-    const std::string fk = std::to_string(c.w) + "x" + std::to_string(c.h) + " " + std::to_string(c.BackdropSig());
+    const std::string fk = std::to_string(c.w) + "x" + std::to_string(c.h) + " " + std::to_string(c.BackdropSig()) + " " + std::to_string(UiScale());
     const bool haveFrame = fk == frameKey && frame.size() == c.px.size();
     const bool solid = haveFrame || laneX >= 0 ? c.backdrop.size() == c.px.size() : Glass::Backdrop(c); // (in the launcher: its page is drawn already)
     const int n = (int)items.size();
     pickRects.clear();
+    parts.clear();
     if (selected < 0 || selected >= n) return;
     const bool wide = c.w >= c.h * 1.2f;
     float pw, ph, k;
-    if (wide)
+    if (wide && UiLarge())
+    {
+        // (Larger menus, on a small screen: the panel fills it, as there is no room to spare
+        // around it, and its contents are larger by as much; the rows scroll.)
+        pw = c.w - 2.0f * std::max(2, c.h / 120);
+        ph = c.h - 2.0f * std::max(2, c.h / 120);
+        k = std::min(ph / 645.0f, pw / 1045.0f) * UiScale();
+    }
+    else if (wide)
     {
         pw = std::min(c.w * 0.76f, c.h * 1.62f);
         ph = std::min(c.h * 0.84f, pw * 0.62f);
-        k = ph / 645.0f;
+        k = ph / 645.0f * UiScale();
     }
     else
     {
         pw = c.w * 0.94f;
         ph = c.h * 0.9f;
-        k = std::min(pw / 560.0f, ph / 1000.0f);
+        k = std::min(pw / 560.0f, ph / 1000.0f) * UiScale();
     }
     k = std::max(k, 0.42f);
     const bool lane = laneX >= 0;
-    if (lane) k = laneK > 0 ? laneK : std::max(0.42f, c.h / 720.0f * 0.94f);
+    if (lane) k = laneK > 0 ? laneK : std::max(0.42f, c.h / 720.0f * 0.94f * UiScale());
     auto K = [&](float v) { return (int)std::lround(v * k); };
     int px0 = (int)((c.w - pw) / 2), py0 = (int)((c.h - ph) / 2), W0 = (int)pw, H0 = (int)ph;
     if (lane) { px0 = laneX; py0 = laneY; W0 = laneW; H0 = laneH; }
@@ -1741,6 +1824,13 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
     { const double t = MenuProfNow(); MenuProf()[0] += t - profT; profT = t; }
     // Header: back button, the page's icon, its title, a line under them.
     backS = lane ? 0 : K(54); backX = px0 + K(28); backY = py0 + K(18);
+    if (backS > 0)
+        for (int i = 0; i < n; i++)
+            if (items[i].kind == K_BACK)
+            {
+                parts.push_back({backX, backY, backS, backS, UiInput::Intent::Back, i, 0});
+                break;
+            }
     if (!lane)
     {
     const bool backChosen = items[selected].kind == K_BACK;
@@ -1787,6 +1877,7 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
         pvX = lanePvX; pvY = py0; pvW = px0 + W0 - pvX; pvH = H0;
         if (laneListH > 0) { listBottom = py0 + laneListH - K(10); pvY = lanePvY; pvH = py0 + H0 - lanePvY; }
     }
+    previewX = pvX; previewY = pvY; previewW = pvW; previewH = pvH; // (for a finger's drag on the Guide's answer)
 
     { const double t = MenuProfNow(); MenuProf()[1] += t - profT; profT = t; }
     // The rows: their places down the list, a section's heading (and a line before every one but
@@ -1848,6 +1939,7 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
     rowY.assign(n, -1);
     ctlW = KR(186);
     if (c.h > c.w) ctlW = std::max(KR(110), (int)(listW * 0.33f)); // (upright: the value under a third of the row, so the name has room)
+    else if (UiLarge()) ctlW = std::min(ctlW, std::max(KR(120), (int)(listW * 0.42f))); // (larger menus: the name keeps its room on a short list)
     ctlX = listX + listW - KR(14) - ctlW;
     bool firstSection = true;
     for (int i = 0; i < n; i++)
@@ -1866,6 +1958,27 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
             if (it.icon >= 0) Glass::DrawIcon(c, it.icon, listX + KR(22), y + headH * 0.52f, 12 * kr, GlassText);
             T(c, listX + KR(50), y + headH * 2 / 3 + KR(1), it.label, KR(22), GlassText, true);
             continue;
+        }
+        {
+            // (The row as the pointer sees it: its name focuses only; links open; Off/On pills and
+            // the chevrons are the controls. The pad reaches the same changes with Left/Right.
+            // These are registered before the row's pixels: a row copied from the cache still
+            // needs its parts, or its controls answer only once it has been drawn again.)
+            // (A row that opens something is a button across its whole width: the label, the value
+            // and the chevron all open it. A value row's name only focuses; its controls change it.)
+            const bool opens = it.kind == K_LINK || it.kind == K_FOLDER || it.kind == K_SLOT || it.kind == K_KEY;
+            parts.push_back({listX, y, opens ? listW : std::max(0, ctlX - listX), rowH,
+                             it.kind == K_BACK ? UiInput::Intent::Back : opens ? UiInput::Intent::Open : UiInput::Intent::Focus, i, 0});
+            if (it.kind == K_TOGGLE)
+            {
+                parts.push_back({ctlX, y, ctlW / 2, rowH, UiInput::Intent::Set, i, 0});
+                parts.push_back({ctlX + ctlW / 2, y, ctlW - ctlW / 2, rowH, UiInput::Intent::Set, i, 1});
+            }
+            else if (it.kind == K_PICKER)
+            {
+                parts.push_back({ctlX, y, ctlW / 2, rowH, UiInput::Intent::Step, i, -1});
+                parts.push_back({ctlX + ctlW / 2, y, ctlW - ctlW / 2, rowH, UiInput::Intent::Step, i, 1});
+            }
         }
         // (Each row is drawn once and copied after, while it stays the same: its words, its place, and
         // whether it or the row above is the chosen one (that one's glow shows through it).
@@ -1967,11 +2080,15 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
                 Glass::Rim(c, bx, by, d, d, KR(6), std::max(1.0f, kr), 0x50, 0x14);
             }
             else if (it.icon >= 0) Glass::DrawIcon(c, it.icon, listX + KR(36) + in, y + rowH * 0.5f, 11 * kr, ink);
-            const int lpx = KR(rowTall > 1 ? 22 : 20); // (the name's size)
+            const int lpx = KR(rowTall > 1 || UiLarge() ? 22 : 20); // (the name's size; larger menus: as a tall row's, the controls being narrower)
             const int base = y + rowH / 2 + lpx * 7 / 20; // (the baseline of the row's text)
             {
                 // (A long name cut to fit before the controls on the right.)
-                const int maxW = (it.kind == K_TOGGLE || it.kind == K_PICKER ? ctlX : listX + listW - KR(90)) - (listX + KR(76) + in) - KR(12);
+                int maxW = (it.kind == K_TOGGLE || it.kind == K_PICKER ? ctlX : listX + listW - KR(90)) - (listX + KR(76) + in) - KR(12);
+                // (A row that opens or does something with a value on its right ("8 ADDED"): the name ends
+                // before it. Translated, the two ran into each other: "Iconos En el Menú Home" over "8 Añadidos".)
+                if (it.kind == K_LINK && !it.value.empty())
+                    maxW = std::min(maxW, listX + listW - KR(44) - W(it.value, KR(rowTall > 1 ? 20 : 17), rowTall > 1) - KR(12) - (listX + KR(76) + in));
                 std::string label = it.label;
                 const bool bold = it.kind == K_FOLDER;
                 int lp2 = lpx; // (A long name shrinks a little first, and is cut only if it still does not fit.)
@@ -2014,11 +2131,12 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
                 const bool arrows = it.kind == K_PICKER && !off;
                 if (arrows)
                 {
-                    Glass::DrawIcon(c, Glass::I_CHEVRON_L, ctlX + KR(14), y + rowH * 0.5f, 9 * kr, GlassText);
-                    Glass::DrawIcon(c, Glass::I_CHEVRON_R, ctlX + ctlW - KR(14), y + rowH * 0.5f, 9 * kr, GlassText);
+                    const bool canL = it.choice > 0, canR = it.choice + 1 < (int)it.choices.size();
+                    Glass::DrawIcon(c, Glass::I_CHEVRON_L, ctlX + KR(14), y + rowH * 0.5f, 9 * kr, canL ? GlassText : GlassOff);
+                    Glass::DrawIcon(c, Glass::I_CHEVRON_R, ctlX + ctlW - KR(14), y + rowH * 0.5f, 9 * kr, canR ? GlassText : GlassOff);
                 }
                 int vpx = KR(19);
-                while (vpx > 8 && W(it.value, vpx, true) > ctlW - KR(56)) vpx--;
+                while (vpx > 8 && W(it.value, vpx, true) > ctlW - KR(UiLarge() ? 40 : 56)) vpx--; // (larger menus: the arrows closer, the value kept large)
                 if (it.kind == K_PICKER) TCentred(c, ctlX + ctlW / 2, base, it.value, vpx, ink, true);
                 else T(c, ctlX + ctlW - W(it.value, vpx), base, it.value, vpx, off ? GlassOff : GlassHint);
             }
@@ -2083,7 +2201,9 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
         }
     }
     const int pad = K(20), innerW = pvW - 2 * pad;
-    const std::string name = it.kind == K_BACK ? std::string("BACK") : it.label;
+    // (A Pokedex entry's card: its name over it, whichever of its rows is chosen.)
+    const bool dexCard = it.preview == P_CDEXMON && it.choice >= 0 && it.choice < (int)companion.dex.size() && !companion.dex[it.choice].hidden;
+    const std::string name = it.kind == K_BACK ? std::string("BACK") : dexCard ? companion.dex[it.choice].name : it.label;
     const std::string desc = it.kind == K_BACK ? std::string("Back to the page before.") : Sentence(it.desc);
     // (A long name, as GUIDE's questions: on two lines, the rest moved down.)
     const float pf = touchRows > 0 ? 1.22f : 1.0f; // (a phone: the preview's writing bigger)
@@ -2096,7 +2216,17 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
         y += (int)(nameLines.size() - 1) * K(32);
     }
     else T(c, pvX + pad, pvY + K(42), name, nameS, GlassText, true);
-    for (const std::string& line : Wrap(desc, descS, innerW, wide ? 7 : 5))
+    // (The description stops above the tip at the foot of the preview: with larger menus on a short
+    // screen it ran into it.)
+    size_t descMax = wide ? 7 : 5;
+    if (UiLarge() && !it.tip.empty())
+    {
+        const int tipLines = (int)Wrap(Sentence(it.tip), K(17), innerW - K(34), 4).size();
+        const int tipTop = pvY + pvH - pad - tipLines * K(23);
+        const int room = tipTop - K(18) - K(8) - (y - descL + K(6));
+        descMax = std::min(descMax, (size_t)std::max(1, room / std::max(1, descL)));
+    }
+    for (const std::string& line : Wrap(desc, descS, innerW, descMax))
     {
         T(c, pvX + pad, y, line, descS, Desc, false, false);
         y += descL;
@@ -2161,11 +2291,40 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
         {
             T(c, x0, gy + K(14), "Answer", K(15), GlassHint, true, false);
             gy += K(26);
-            for (const auto& line : Wrap(a.text, K(19), innerW, 12))
+            // (The answer's own line breaks first: HERE puts each Pokémon on a line, under the way
+            // it is met. Each line still wraps if it is wider than the panel. A longer answer
+            // scrolls with Left/Right; the bar on the right says how much there is.)
+            std::vector<std::string> lines;
+            size_t at = 0;
+            while (at <= a.text.size())
             {
-                if (gy + K(28) > regionBottom) break;
-                T(c, x0, gy + K(18), line, K(19), GlassText, false, false);
-                gy += K(28);
+                size_t nl = a.text.find('\n', at);
+                const std::string para = a.text.substr(at, nl == std::string::npos ? std::string::npos : nl - at);
+                for (const auto& line : Wrap(para, K(18), innerW - K(10), 80)) lines.push_back(line);
+                if (nl == std::string::npos) break;
+                at = nl + 1;
+            }
+            const int lineH = K(24);
+            previewLineH = lineH; // (a finger's drag on the answer moves it a line at a time)
+            const int room = std::max(0, (regionBottom - gy) / lineH);
+            const int maxScroll = std::max(0, (int)lines.size() - room);
+            a.scrollMax = maxScroll; // (the guide's Left/Right clamps to it)
+            const int first = std::clamp(a.scroll, 0, maxScroll);
+            const int textTop = gy;
+            for (int i = first; i < (int)lines.size() && i < first + room; i++)
+            {
+                T(c, x0, gy + K(16), lines[i], K(18), GlassText, false, false);
+                gy += lineH;
+            }
+            if (maxScroll > 0)
+            {
+                const int barX = x0 + innerW - K(7);
+                const int barTop = textTop + K(2);
+                const int barH = std::max(K(20), regionBottom - barTop);
+                Glass::Round(c, barX, barTop, K(3), barH, K(2), 0x30FFFFFF);
+                const int thumbH = std::max(K(18), barH * room / (int)lines.size());
+                const int thumbY = barTop + (barH - thumbH) * first / std::max(1, maxScroll);
+                Glass::Round(c, barX, thumbY, K(3), thumbH, K(2), 0xA0FFFFFF);
             }
         }
         else
@@ -2181,7 +2340,7 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
         ItemSummary(c, companion, companion.bag[it.choice], pvX + pad, regionTop, innerW, regionBottom, k);
     else if ((it.preview == P_CPARTY || it.preview == P_CBAG || it.preview == P_CDEX || it.preview == P_CPLACE) &&
              CompanionPicture(c, companion, it.preview, pvX + pad, regionTop, innerW, regionBottom, k,
-                              it.kind == K_PICKER ? it.choice : -1, it.kind == K_PICKER ? &pickRects : nullptr))
+                              it.kind == K_PICKER ? it.choice : -1, it.kind == K_PICKER ? &pickRects : nullptr, it.label))
     {
     }
     else if (it.preview == P_TOUCH && regionBottom - regionTop > K(60))
@@ -2230,7 +2389,11 @@ inline void Menu::DrawSettings(Canvas& c, const std::string& title, const std::s
             const int ci = onlyOn ? (i == choices - 1 ? it.choice : 0) : i; // (the choice this card shows)
             const bool on = ci == it.choice;
             if (!onlyOn && !it.disabled && (it.kind == K_PICKER || it.kind == K_TOGGLE)) // (a card to tap: its whole cell)
-                pickRects.push_back({ side ? sideX : cx - cellW / 2, cy - K(6), side ? sideW + gapX + picW : cellW, rowH + K(12), ci });
+            {
+                const std::array<int, 5> r{ side ? sideX : cx - cellW / 2, cy - K(6), side ? sideW + gapX + picW : cellW, rowH + K(12), ci };
+                pickRects.push_back(r);
+                parts.push_back({r[0], r[1], r[2], r[3], UiInput::Intent::Set, selected, ci});
+            }
             if (pictures)
             {
                 const int x = side ? sideX + sideW + gapX : cx - picW / 2, py = side ? cy + (rowH - picH) / 2 : cy;
@@ -2541,14 +2704,20 @@ inline void Menu::DrawDialog(Canvas& c, const std::string& title, const std::str
     static bool baseSolid = false;
     static int basePy = 0, basePh = 0;
     const bool touch = touchRows > 1.0f;
-    const float k = std::max(0.42f, std::min(c.w / (touch ? 620.0f : 1400.0f), c.h / (touch ? 480.0f : 788.0f)));
-    const std::string key = std::to_string(c.w) + "x" + std::to_string(c.h) + " " + std::to_string(c.BackdropSig()) + " " + std::to_string(dialogIcon) + "|" + std::to_string(touch) + "|" +
+    // (Larger menus: the phone's size, which fills a short screen, and no larger: past it the dialog
+    // would not fit.)
+    const bool large = !touch && UiLarge();
+    const float k = large ? std::max(0.42f, std::min(c.w / 620.0f, c.h / 480.0f) * std::min(1.0f, UiScale() / 1.5f))
+                          : std::max(0.42f, std::min(c.w / (touch ? 620.0f : 1400.0f), c.h / (touch ? 480.0f : 788.0f)));
+    const std::string key = std::to_string(c.w) + "x" + std::to_string(c.h) + " " + std::to_string(k) + " " + std::to_string(c.BackdropSig()) + " " + std::to_string(dialogIcon) + "|" + std::to_string(touch) + "|" +
         title + "|" + text + "|" + hint + "|" + std::to_string(UiLang::lang);
     auto K = [&](float v) { return (int)std::lround(v * k); };
+    const int pw = std::min(c.w - K(32), K(520)); // (the card's width: the same on both paths)
     if (key == baseKey && base.size() == c.px.size())
     {
         std::copy(base.begin(), base.end(), c.px.begin());
         Glass::Mark(c, 0, 0, c.w, c.h);
+        cardX = (c.w - pw) / 2; cardY = basePy; cardW = pw; cardH = basePh;
         DrawDialogButtons(c, basePy, basePh, k, baseSolid);
         return;
     }
@@ -2556,11 +2725,12 @@ inline void Menu::DrawDialog(Canvas& c, const std::string& title, const std::str
     if (solid) Glass::Frost(c, 0, 0, c.w, c.h, 0);
     else Glass::Round(c, 0, 0, c.w, c.h, 0, GlassShade);
     Glass::Round(c, 0, 0, c.w, c.h, 0, 0x1C000000); // (the game a touch darker behind the card)
-    const int pw = std::min(c.w - K(32), K(520)), innerW = pw - K(64);
+    const int innerW = pw - K(64);
     const int bodyFont = K(touch ? 22 : 17), lineHeight = K(touch ? 32 : 25);
     const auto lines = text.empty() ? std::vector<std::string>() : Wrap(text, bodyFont, innerW, 4);
     const int ph = K(touch ? 280 : 250) + (int)lines.size() * lineHeight;
     const int px = (c.w - pw) / 2, py = (c.h - ph) / 2;
+    cardX = px; cardY = py; cardW = pw; cardH = ph;
     Glass::Shadow(c, px, py, pw, ph, 26 * k, 30 * k, 0x90);
     if (solid) Glass::Frost(c, px, py, pw, ph, 26 * k);
     Glass::Round(c, px, py, pw, ph, 26 * k, Panel); // (the same glass as the settings pages)
@@ -2629,15 +2799,18 @@ inline void LiveBand(int x0, int x1, int h, int gap, int& top, int& bottom)
 // glass panel down the right of the screen, its tabs as icons along its top, the chosen tab's
 // picture under them. Tinted glass with a lit rim, no frost (it is drawn every frame over a moving
 // game). tabRects: where each tab was drawn, for taps.
-inline void CompanionWindow(Canvas& c, const Menu::CompanionView& cv, int tab, int (*tabRects)[4] = nullptr, int* panelRect = nullptr, bool full = false)
+inline void CompanionWindow(Canvas& c, const Menu::CompanionView& cv, int tab, int (*tabRects)[4] = nullptr, int* panelRect = nullptr, bool full = false,
+    bool inBattle = false)
 {
     using namespace SettingsArt;
     // (A card in the top right corner, about a quarter of the screen across and two thirds down:
     // the game stays the main thing on one screen. full: the whole canvas, a second screen's, over
     // the blurred game already in it.)
     const float margin = std::min(c.w, c.h) * (full ? 0.035f : 0.03f);
-    int ph = full ? (int)(c.h - 2 * margin) : (int)(c.h * 0.68f);
-    const int pw = full ? (int)(c.w - 2 * margin) : (int)std::min(c.w * 0.25f, ph * 0.64f);
+    // (Larger menus, on a small screen: taller and wider, its writing larger with it.)
+    const bool large = !full && UiLarge();
+    int ph = full ? (int)(c.h - 2 * margin) : (int)(c.h * (large ? 0.9f : 0.68f));
+    const int pw = full ? (int)(c.w - 2 * margin) : (int)std::min(c.w * (large ? 0.42f : 0.25f), ph * 0.64f);
     const int px = (int)(c.w - pw - margin);
     int py = (int)margin;
     if (!full)
@@ -2648,7 +2821,12 @@ inline void CompanionWindow(Canvas& c, const Menu::CompanionView& cv, int tab, i
         py = top;
         ph = std::max(std::min(ph, bottom - top), (int)(c.h * 0.3f));
     }
-    const float k = full ? std::max(0.5f, std::min(c.w, c.h) / 560.0f) : std::max(0.42f, ph / 640.0f);
+    // (Its size as always; in a battle (inBattle) it then ends half way down, above your Pokemon's HP
+    // box, which sits from about there in the widened battle.)
+    const int sizePh = ph;
+    if (!full && inBattle) ph = std::max((int)(c.h * 0.3f), std::min(ph, (int)(c.h * 0.48f) - py));
+    const float k = full ? std::max(0.5f, std::min(c.w, c.h) / 560.0f * std::min(UiScale(), 1.3f))
+                         : std::max(0.42f, large ? std::min(sizePh / 640.0f, pw / 410.0f) : sizePh / 640.0f);
     auto K = [&](float v) { return (int)std::lround(v * k); };
     if (panelRect) { panelRect[0] = px; panelRect[1] = py; panelRect[2] = pw; panelRect[3] = ph; }
     // (No shadow round it: over the bright game it reads as a dark border.)
@@ -2678,7 +2856,8 @@ inline void CompanionWindow(Canvas& c, const Menu::CompanionView& cv, int tab, i
     else if (tab == 4 && !cv.battle.empty()) CompanionPicture(c, cv, Menu::P_CBATTLE, x0, top, w0, bottom, k);
     else
     {
-        const char* text = tab == 4 ? "Opens by itself when a battle starts: the Pokemon you face, its weaknesses and how your moves do."
+        const char* text = tab == 4 ? (cv.battleMapped ? "Opens by itself when a battle starts: the Pokemon you face, its weaknesses and how your moves do."
+                                                       : "Not in this game yet: its battles cannot be read.")
                                     : "Hints for where you are in the game, the answer hidden until you ask.";
         int y = top + K(20);
         for (const std::string& l : Wrap(text, K(16), w0, 6)) { T(c, x0, y, l, K(16), Desc, false, false); y += K(24); }
@@ -2692,7 +2871,7 @@ inline void CompanionWindow(Canvas& c, const Menu::CompanionView& cv, int tab, i
 inline void PartyHud(Canvas& c, const Menu::CompanionView& cv, int top = -1, float scale = 0)
 {
     using namespace SettingsArt;
-    const float k = scale > 0 ? scale : std::max(0.42f, std::min(c.w, c.h) / 720.0f);
+    const float k = scale > 0 ? scale : std::max(0.42f, std::min(c.w, c.h) / 720.0f * UiScale());
     auto K = [&](float v) { return (int)std::lround(v * k); };
     const int cw = K(132), ch = K(46), gap = K(6), x = K(16);
     int y = top >= 0 ? top : K(16);
@@ -2716,7 +2895,7 @@ inline void PartyHud(Canvas& c, const Menu::CompanionView& cv, int top = -1, flo
         }
         else Glass::DrawIcon(c, Glass::I_POKEBALL, ix + is * 0.5f, iy + is * 0.5f, is * 0.3f, m.hp == 0 ? Menu::GlassOff : Menu::GlassText);
         const int bx = ix + is + K(6), bw = x + cw - K(10) - bx;
-        const std::string lv = m.egg ? std::string("Egg") : "Lv " + std::to_string(m.level);
+        const std::string lv = m.egg ? UiLang::Tr("Egg") : "Lv " + std::to_string(m.level);
         T(c, bx, y + K(19), lv, K(12), m.hp == 0 && !m.egg ? Menu::GlassOff : Menu::GlassText, true, false);
         if (!m.egg)
         {
@@ -2747,7 +2926,7 @@ inline std::string MoneyText(long long money)
 inline void StatusBar(Canvas& c, const std::string& place, int balls, const std::string& clock, int battery, long long money = -1)
 {
     using namespace SettingsArt;
-    const float k = std::max(0.42f, std::min(c.w, c.h) / 720.0f);
+    const float k = std::max(0.42f, std::min(c.w, c.h) / 720.0f * UiScale());
     auto K = [&](float v) { return (int)std::lround(v * k); };
     const int h = K(34), px = K(15);
     // (Each part: an icon and its text; their widths first, to centre the strip.)

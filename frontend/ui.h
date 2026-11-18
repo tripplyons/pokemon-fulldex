@@ -6,11 +6,46 @@
 #include <chrono>
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
 
 #include "ui_text.h"
+#include "ui_input.h"
+
+// UI SIZE (settings: ui_size): how large the menus and overlays are, against what the screen alone
+// makes them. Everything is drawn in proportion to the screen's lines, which on a handheld's small
+// screen (640 x 480 at 3.5 inches) made the writing a millimetre high.
+//
+// For any piece of the interface, larger menus are:
+//   UiScale()   the factor; multiply a size that follows the screen by it (1 unless UI SIZE says so).
+//   UiLarge()   above 1: for a layout that has to change, not only grow (a panel filling the screen).
+//   UiMinPx(px) a size of writing, never under 13 pixels with larger menus (the least that reads).
+// At 1 (UiLarge() false) everything is drawn exactly as before.
+#include "ssr_os.h"
+inline float& UiScale() { static float s = 1.0f; return s; } // (set by UiScaleFor, from the settings)
+inline bool UiLarge() { return UiScale() > 1.0f; }
+inline int UiMinPx(int px) { return UiLarge() ? std::max(px, 13) : px; }
+// ui_size's value: "auto" or a percentage from 50 to 300. Auto: 1.5 on a handheld's small screen,
+// under 720 lines, else 1. Phones and the Switch: always 1, as they size their menus for their own
+// screens already (PhoneUi, touchRows); a percentage is the player's own choice there too.
+// screenLines: the display's own height, not the window's, so a small window on a large screen
+// stays as it was.
+inline float UiScaleFor(const std::string& v, int screenLines)
+{
+    if (v.empty() || v == "auto")
+    {
+#if defined(SSR_PHONE) || defined(__SWITCH__)
+        (void)screenLines;
+        return 1.0f;
+#else
+        return screenLines > 0 && screenLines < 720 ? 1.5f : 1.0f;
+#endif
+    }
+    const int p = atoi(v.c_str());
+    return p >= 50 && p <= 300 ? p / 100.0f : 1.0f;
+}
 
 struct Canvas
 {
@@ -248,6 +283,7 @@ struct Menu
     // the companion (companion_data.h); icons and the map from the player's own ROM, ARGB.
     struct CompanionView
     {
+        bool battleMapped = true; // (false: this game's battles are not read, Companion::BattleMapped)
         struct Mon
         {
             std::string name, item; int level = 0, hp = 0, maxHp = 0, status = 0; bool egg = false; std::vector<uint32_t> icon; int iconW = 0, iconH = 0;
@@ -272,13 +308,25 @@ struct Menu
         struct DexEntry
         {
             int id = 0, type1 = -1, type2 = -1, base[6] = {}; bool seen = false, caught = false, hidden = false; // (hidden: not seen, not yet shown)
+            bool stateKnown = true; // (false: whether seen or caught is not known (the GBA games'), so not said)
             std::string name, desc; std::vector<std::string> abilities, evolutions; std::vector<uint32_t> icon;
-            struct Learn { int level = 0, type = -1; std::string move; };
+            struct Learn { int level = 0, type = -1; std::string move, label; };
             std::vector<Learn> learns; // (moves it learns by level, in order)
+            // (Its own page, P_CDEXMON on PAGE_CDEXDETAIL: the battle picture from the ROM (ARGB,
+            // normal and shiny), its details as label and value, what hits it hard or not, the
+            // machines it can use (label "TM06") and its egg moves; companion_dex.h.)
+            std::vector<uint32_t> pic, shinyPic; int picW = 0, picH = 0;
+            std::vector<std::pair<std::string, std::string>> facts;
+            struct Weakness { int pct = 100; std::vector<int> types; };
+            std::vector<Weakness> weak; // (4x, 2x, half, quarter, none; 1x left out)
+            std::vector<Learn> machines, eggs, tutors;
+            std::vector<std::pair<std::string, std::string>> found; // (where to find it: place, how and levels)
         };
         std::vector<DexEntry> dex;
         // (GUIDE's answers, P_CGUIDE: each shown once chosen with Enter or a tap.)
-        struct GuideAnswer { std::string text; bool shown = false; };
+        // (scroll: the first line shown in the preview; scrollMax: the last one it can start at, set
+        // by the preview as it draws, so Left/Right in the Guide knows where the answer ends.)
+        struct GuideAnswer { std::string text; bool shown = false; int scroll = 0; mutable int scrollMax = 0; };
         std::vector<GuideAnswer> guide;
         bool dexMoves = false;
         // (BATTLE INFO, in a battle: the foe (P_CBFOE: its types, ability, item, HP and what hits it
@@ -305,6 +353,10 @@ struct Menu
     mutable std::vector<std::array<int, 5>> pickRects;
     int pickWanted = -1;
     int pickY = 0; // (the tap's y, for SettingsTap)  // (a page of a few links, as SETTINGS: rows sharing the list's height, a line under each name)
+    // (Touch/mouse: the visible controls registered by the last draw — row labels (Focus), Off/On
+    // pills and preview cards (Set), chevrons (Step), links and Back (Open/Back). The pad path
+    // reaches the same changes from the focused row (Menu::UpdateSettings).)
+    mutable std::vector<UiInput::Part> parts;
     // P_SHORTCUTS (CONTROLS): Fulldex's four shortcuts, FAST, SWAP, SAVE, LOAD, each with its key
     // and its controller button ("" where there is none). P_TOUCH: the on-screen controls, each
     // a circle (r) or a pill (w, h), in parts of the screen.
@@ -433,9 +485,10 @@ struct Menu
         if(style!=1&&columns>0&&!nowPlaying.idle){const int b=NowPlayingAt(x,y);if(b>=0){npFocus=-1;npAction=b;return;}}
         if(style==2)
         {
-            // (On a button: it is chosen and pressed. Outside the card: CANCEL.)
+            // (On a button: it is chosen and pressed. Outside the card: CANCEL, as the hint says.)
             for(int b=0;b<2;b++)
                 if(dialogW>0&&x>=dialogX[b]&&x<dialogX[b]+dialogW&&y>=dialogY&&y<dialogY+dialogH){selected=b==0?(int)items.size()-1:0;input.accept=true;return;}
+            if (cardW > 0 && (x < cardX || x >= cardX + cardW || y < cardY || y >= cardY + cardH)) input.back = true;
             return;
         }
         const int item=ItemAt(x,y);
@@ -614,21 +667,33 @@ struct Menu
         drawnLineH = 0; drawnFirstY = 0; scroll = 0;
         const int headY = gy - 9 * scale - gap;
         TXRaw(c, gx, headY, "Fulldex", scale, GlassText);
-        // (One size for every tile's name: the largest at which the longest still fits.)
+        // (One size for every tile's name: the largest at which the longest still fits. Larger
+        // menus: clean text a pixel at a time, as in whole steps of the pixel font's scale one long
+        // name, as ACHIEVEMENTS, halved them all.)
         int ls = scale;
         for (int i = 0; i < n; i++)
             while (ls > 1 && TW(items[i].label, ls, true) > s * 0.88f) ls--;
+        tilesLabelPx = 0;
+        if (UseClean() && UiLarge())
+        {
+            int lp = Px(scale, true);
+            for (int i = 0; i < n; i++)
+                while (lp > Px(1, true) && CleanFont::Width(CleanFont::Title(UiLang::Tr(items[i].label)), lp, true) > s * 0.88f) lp--;
+            tilesLabelPx = lp;
+        }
         TX(c, gx + gridW - TW("PAUSED", scale), headY, "PAUSED", scale, GlassHint);
         for (int i = 0; i < n; i++)
         {
-            const int x = gx + (i % cols) * (s + gap), y = gy + (i / cols) * (s + gap);
+            // (A last row that isn't full is centred under the others.)
+            const int inRow = i / cols == rows - 1 ? n - (rows - 1) * cols : cols;
+            const int x = gx + (cols - inRow) * (s + gap) / 2 + (i % cols) * (s + gap), y = gy + (i / cols) * (s + gap);
             tileX[i] = x; tileY[i] = y;
             const bool sel = false, off = items[i].disabled; // (the highlight: DrawChosenTile, over this)
             if (sel) Glass::Glow(c, x, y, s, s, s * 0.09f, s / 200.0f);
             FrostBox(c, solid, x, y, s, s, s * 0.09f, sel, sel ? (float)std::max(2, scale) : 1.0f);
             const uint32_t ink = off ? GlassOff : GlassText;
             if (items[i].icon >= 0) Glass::DrawIcon(c, items[i].icon, x + s * 0.5f, y + s * 0.4f, s * 0.19f, ink);
-            TX(c, x + (s - TW(items[i].label, ls, true)) / 2, y + (int)(s * 0.72f), items[i].label, ls, ink, true);
+            TileLabel(c, x, y, s, items[i].label, ls, ink);
             if (!items[i].value.empty())
             {
                 const int vs = std::max(1, ls - 1);
@@ -652,7 +717,13 @@ struct Menu
         DrawChosenTile(c);
     }
     mutable bool tilesSolid = false;
-    mutable int tilesLabelScale = 1, tilesScale = 1;
+    mutable int tilesLabelScale = 1, tilesScale = 1, tilesLabelPx = 0;
+    void TileLabel(Canvas& c, int x, int y, int s, const std::string& label, int ls, uint32_t ink) const
+    {
+        if (tilesLabelPx <= 0) { TX(c, x + (s - TW(label, ls, true)) / 2, y + (int)(s * 0.72f), label, ls, ink, true); return; }
+        const std::string t = CleanFont::Title(UiLang::Tr(label));
+        CleanFont::Draw(c, x + (s - CleanFont::Width(t, tilesLabelPx, true)) / 2, y + (int)(s * 0.72f) + tilesLabelPx / 2, t, tilesLabelPx, ink, true);
+    }
     // The chosen tile, lit, over the page as DrawTiles left it.
     void DrawChosenTile(Canvas& c) const
     {
@@ -664,7 +735,7 @@ struct Menu
         FrostBox(c, tilesSolid, x, y, s, s, s * 0.09f, true, (float)std::max(2, scale), true);
         const uint32_t ink = off ? GlassOff : GlassText;
         if (items[i].icon >= 0) Glass::DrawIcon(c, items[i].icon, x + s * 0.5f, y + s * 0.4f, s * 0.19f, ink);
-        TX(c, x + (s - TW(items[i].label, ls, true)) / 2, y + (int)(s * 0.72f), items[i].label, ls, ink, true);
+        TileLabel(c, x, y, s, items[i].label, ls, ink);
         if (!items[i].value.empty())
         {
             const int vs = std::max(1, ls - 1);
@@ -806,6 +877,8 @@ struct Menu
     // last item CANCEL, drawn side by side as pills (CANCEL first); dialogIcon above the title.
     int dialogIcon = -1;
     mutable int dialogX[2] = {}, dialogY = 0, dialogW = 0, dialogH = 0;
+    // (The card's whole rect, for a tap outside it: that cancels, as the page's hint says.)
+    mutable int cardX = 0, cardY = 0, cardW = 0, cardH = 0;
     void DrawDialog(Canvas& c, const std::string& title, const std::string& text, const std::string& hint) const;
     void DrawDialogButtons(Canvas& c, int py, int ph, float k, bool solid) const;
     // (A settings page of state slots, SAVE and LOAD: its other rows as pills across the top, the
@@ -827,6 +900,9 @@ struct Menu
     // and size, the controls' box on the right of them, and the back button.
     mutable std::vector<int> rowY;
     mutable int rowX = 0, rowW = 0, rowH = 0, ctlX = 0, ctlW = 0, backX = 0, backY = 0, backS = 0, scrollPx = 0;
+    // (The preview's box and a Guide answer's line height: a finger dragged on the preview scrolls
+    // that answer rather than the list.)
+    mutable int previewX = 0, previewY = 0, previewW = 0, previewH = 0, previewLineH = 1;
 };
 
 #include "ui_settings.h"

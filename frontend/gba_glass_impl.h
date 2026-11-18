@@ -3,6 +3,7 @@
 #pragma once
 #include "gba_glass.h"
 #include "state_slots.h"
+#include "menu_drag.h"
 
 namespace GbaGlass
 {
@@ -10,13 +11,17 @@ static_assert(IC_PLAY == Glass::I_PLAY && IC_SAVE == Glass::I_SAVE && IC_LOAD ==
               IC_FAST == Glass::I_FAST && IC_TROPHY == Glass::I_TROPHY && IC_GEAR == Glass::I_GEAR && IC_POWER == Glass::I_POWER &&
               IC_MONITOR == Glass::I_MONITOR && IC_RATIO == Glass::I_RATIO && IC_EXPAND == Glass::I_EXPAND &&
               IC_FULLSCREEN == Glass::I_FULLSCREEN && IC_GRID == Glass::I_GRID && IC_PAD == Glass::I_PAD && IC_GAUGE == Glass::I_GAUGE &&
-              IC_SPARKLE == Glass::I_SPARKLE && IC_INFO == Glass::I_INFO && IC_SPEAKER == Glass::I_SPEAKER && IC_REWIND == Glass::I_REWIND,
+              IC_SPARKLE == Glass::I_SPARKLE && IC_INFO == Glass::I_INFO && IC_SPEAKER == Glass::I_SPEAKER && IC_REWIND == Glass::I_REWIND &&
+              IC_PEOPLE == Glass::I_PEOPLE && IC_POKEBALL == Glass::I_POKEBALL && IC_NOTE == Glass::I_NOTE &&
+              IC_GLOBE == Glass::I_GLOBE && IC_CHIP == Glass::I_CHIP,
               "gba_glass.h's icon numbers are Glass::Icon's");
 
 namespace
 {
 struct State
 {
+    MenuDrag drag;
+    int64_t finger = 0;
     Canvas canvas;
     Menu menu;
     std::vector<uint32_t> shot; // the paused game, w x h
@@ -31,7 +36,7 @@ void Sync(const Page& p)
     State& s = S();
     Menu& m = s.menu;
     m.open = true;
-    m.columns = p.style == TILES ? 4 : 0;
+    m.columns = p.style == TILES ? (p.items.size() > 8 ? 5 : 4) : 0; // (the DS games' two rows of five)
     m.style = p.style == PAGE ? 1 : p.style == DIALOG ? 2 : 0;
     m.pageIcon = p.style == PAGE ? p.icon : -1;
     m.dialogIcon = p.style == DIALOG ? p.icon : -1;
@@ -61,11 +66,40 @@ void Sync(const Page& p)
         b.choices = a.choices;
         b.choice = a.choice;
         b.preview = Menu::P_NONE;
+        if (a.dexCard >= 0 && a.dexCard < (int)p.dex.size()) { b.preview = Menu::P_CDEXMON; b.choice = a.dexCard; }
+        if (a.monCard >= 0 && a.monCard < (int)p.mons.size()) { b.preview = Menu::P_CMON; b.choice = a.monCard; }
+        if (a.placeCard) b.preview = Menu::P_CPLACE;
+    }
+    // (POKEDEX's cards, as the DS games' entries; seen and caught from the save where it was read.)
+    m.companion.dex.clear();
+    for (const DexCard& d : p.dex)
+    {
+        Menu::CompanionView::DexEntry e;
+        e.id = d.id; e.type1 = d.type1; e.type2 = d.type2;
+        for (int i = 0; i < 6; i++) e.base[i] = d.base[i];
+        e.name = d.name; e.desc = d.desc; e.abilities = d.abilities; e.evolutions = d.evolutions;
+        e.pic = d.pic; e.shinyPic = d.shinyPic; e.picW = d.picW; e.picH = d.picH;
+        e.stateKnown = d.state >= 0; e.seen = d.state != 0; e.caught = d.state == 2;
+        m.companion.dex.push_back(std::move(e));
+    }
+    m.companion.place = p.place; m.companion.area.clear();
+    m.companion.map = p.map; m.companion.mapW = p.mapW; m.companion.mapH = p.mapH;
+    m.companion.markerX = p.markerX; m.companion.markerY = p.markerY;
+    m.companion.party.clear();
+    for (const MonCard& d : p.mons)
+    {
+        Menu::CompanionView::Mon e;
+        e.name = d.name; e.item = d.item; e.level = d.level; e.hp = d.hp; e.maxHp = d.maxHp; e.status = d.status; e.egg = d.egg;
+        e.icon = d.icon; e.iconW = d.iconW; e.iconH = d.iconH; e.type1 = d.type1; e.type2 = d.type2; e.nature = d.nature; e.ability = d.ability;
+        for (int i = 0; i < 6; i++) { e.stats[i] = d.stats[i]; e.iv[i] = d.iv[i]; e.ev[i] = d.ev[i]; }
+        for (const auto& mv : d.moves) e.moves.push_back({ mv.name, mv.type, mv.pp, mv.maxPp });
+        m.companion.party.push_back(std::move(e));
     }
     // (Another page: its list from the top.)
     const std::string pk = std::to_string(p.style) + "|" + p.title;
     if (pk != s.pageKey)
     {
+        s.drag.active = false;
         s.pageKey = pk;
         m.scroll = 0;
         m.scrollPx = 0;
@@ -116,6 +150,7 @@ bool LoadSlotPicture(const std::string& statePath, std::vector<uint32_t>& argb, 
 
 void Frame(const uint32_t* argb, int w, int h)
 {
+    S().drag.active = false; // a newly opened pause menu starts a new gesture
     State& s = S();
     if (!argb || w <= 0 || h <= 0)
     {
@@ -156,6 +191,45 @@ void Tap(Page& page, int x, int y, Input& out, int& slider, int& pick)
     out.up = mi.up; out.down = mi.down; out.left = mi.left; out.right = mi.right; out.accept = mi.accept; out.back = mi.back;
 }
 
+void CancelTouch() { S().drag.active = false; }
+
+void Touch(Page& page, TouchPhase phase, int64_t finger, int x, int y, Input& out, int& slider, int& pick)
+{
+    Sync(page);
+    State& s = S();
+    Menu& m = s.menu;
+    slider = pick = -1;
+    if (s.drag.active)
+    {
+        if (finger != s.finger) return;
+        const int threshold = std::max(12, s.canvas.h / 60);
+        if (m.style == 1)
+        {
+            if (s.drag.Move(y, threshold, m.scrollPx)) m.freeScroll = true;
+        }
+        else
+        {
+            int pixels = 0;
+            if (s.drag.Move(y, threshold, pixels) && m.drawnLineH > 0)
+            {
+                m.scroll = std::max(0, pixels / m.drawnLineH);
+                m.freeScroll = true;
+            }
+        }
+        if (phase == TOUCH_UP && s.drag.End()) Tap(page, x, y, out, slider, pick);
+        return;
+    }
+    if (phase != TOUCH_DOWN) return;
+    const bool settingsRows = m.style == 1 && !m.keyGrid && !m.slotGrid;
+    const bool plainList = m.style == 0 && m.columns == 0 && m.drawnLineH > 0 && m.ItemAt(x, y) != -2;
+    if (settingsRows || plainList)
+    {
+        s.drag.Begin(y, m.style == 1 ? m.scrollPx : m.scroll * m.drawnLineH);
+        s.finger = finger;
+    }
+    else Tap(page, x, y, out, slider, pick);
+}
+
 const uint32_t* Draw(const Page& page, int w, int h, bool& changed)
 {
     State& s = S();
@@ -184,7 +258,10 @@ const uint32_t* Draw(const Page& page, int w, int h, bool& changed)
     for (const Item& it : page.items)
         key += "|" + it.label + "=" + it.value + "," + std::to_string(it.kind) + "," + std::to_string(it.choice) + "," + std::to_string(it.slider) + "," +
                std::to_string(it.disabled) + "," + it.sub + "," + it.desc + "," + std::to_string(it.thumb.size()) + "," +
-               std::to_string(it.thumb.empty() ? 0u : it.thumb[it.thumb.size() / 2]);
+               std::to_string(it.thumb.empty() ? 0u : it.thumb[it.thumb.size() / 2]) + "," + std::to_string(it.dexCard) + "," + std::to_string(it.monCard);
+    for (const DexCard& d : page.dex) key += "|d" + std::to_string(d.id) + "," + std::to_string(d.pic.size());
+    key += "|p" + page.place + std::to_string(page.map.size()) + "," + std::to_string(page.markerX);
+    for (const MonCard& d : page.mons) key += "|m" + d.name + "," + std::to_string(d.hp) + "," + std::to_string(d.level);
     changed = key != s.key;
     if (changed)
     {
@@ -195,5 +272,61 @@ const uint32_t* Draw(const Page& page, int w, int h, bool& changed)
         // (Drawing can move the list to keep the chosen row in view: the next key then says so.)
     }
     return c.px.data();
+}
+}
+
+// FULLDEX NAV for the GBA games (gba_glass.h): the DS games' own drawing, kept until something on it changes.
+#include "fulldex_nav.h"
+namespace GbaGlass
+{
+namespace
+{
+struct NavPicture { Canvas c; std::string key; };
+NavPicture& NavWatch() { static NavPicture p; return p; }
+NavPicture& NavCounter() { static NavPicture p; return p; }
+// Where the watch goes: as the DS games place it (FdNav::Place; centre: the touch controls are up).
+FdNav::Geo NavPlace(const Nav& nav, int w, int h) { return FdNav::Place(w, h, nav.centre, nav.style); }
+}
+const uint32_t* NavDraw(const Nav& nav, int w, int h, bool& changed)
+{
+    NavPicture& p = NavWatch();
+    const FdNav::Geo g = NavPlace(nav, w, h);
+    FdNav::State s;
+    s.open = true;
+    s.sel = nav.sel;
+    s.count = nav.count;
+    char clock[8] = "--:--";
+    const time_t now = time(nullptr);
+    if (const tm* t = localtime(&now)) snprintf(clock, sizeof clock, "%02d:%02d", t->tm_hour, t->tm_min);
+    std::string key = std::to_string(w) + "x" + std::to_string(h) + "|" + std::to_string(nav.style) + "|" + std::to_string(nav.centre) + "|" +
+                      std::to_string(nav.sel) + "|" + std::to_string(nav.count) + "|" + clock + "|" + nav.hint + "|" + std::to_string(UiLang::lang);
+    for (int i = 0; i < FdNav::APPS; i++) { key += nav.dim[i] ? "|1" : "|0"; key += nav.label[i]; }
+    changed = key != p.key || p.c.w != w || p.c.h != h;
+    if (changed)
+    {
+        p.c.Resize(w, h);
+        p.c.Clear();
+        FdNav::Draw(p.c, g, s, nav.dim, nav.label, nav.hint, nav.style);
+        p.key = key;
+    }
+    return p.c.px.data();
+}
+int NavHit(const Nav& nav, int w, int h, int x, int y)
+{
+    return FdNav::Hit(NavPlace(nav, w, h), x, y);
+}
+const uint32_t* NavCount(int count, int w, int h, bool& changed)
+{
+    NavPicture& p = NavCounter();
+    const std::string key = std::to_string(w) + "x" + std::to_string(h) + "|" + std::to_string(count);
+    changed = key != p.key || p.c.w != w || p.c.h != h;
+    if (changed)
+    {
+        p.c.Resize(w, h);
+        p.c.Clear();
+        FdNav::DrawCount(p.c, w, h, count, 0);
+        p.key = key;
+    }
+    return p.c.px.data();
 }
 }

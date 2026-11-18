@@ -432,6 +432,20 @@ build_linux() {
     cp "$LSDL/build/libSDL2-2.0.so.0" "$OUT/libSDL2-2.0.so.0"
     "$strip_bin" "$OUT/libSDL2-2.0.so.0"
     cp "$LSDL/SDL2-$SDL_VERSION/LICENSE.txt" "$OUT/LICENSE-SDL2.txt"
+    # Omega Ruby and Alpha Sapphire (frontend/n3ds.h), x86_64 only: SSR_3DS_LINUX_KIT, the folder of
+    # their Linux program (pokemon-oras, optional), put in 3ds/program. Nothing of the games in it.
+    if [ "$arch" = x86_64 ] && [ -n "${SSR_3DS_LINUX_KIT:-}" ]; then
+        [ -x "$SSR_3DS_LINUX_KIT/pokemon-oras" ] || fail "SSR_3DS_LINUX_KIT: no pokemon-oras in $SSR_3DS_LINUX_KIT"
+        mkdir -p "$OUT/3ds/program"
+        # (cp -r does not keep the executable bits, and cp -a cannot set them on an NTFS or
+        # exFAT folder (it fails to chmod). Copy the tree, then mark its executables here;
+        # where chmod is refused the files are executable by default anyway.)
+        cp -r "$SSR_3DS_LINUX_KIT/." "$OUT/3ds/program/" || fail "copying the 3DS program"
+        ( cd "$SSR_3DS_LINUX_KIT" && find . -type f -perm -u+x -print0 ) |
+            while IFS= read -r -d '' f; do chmod +x "$OUT/3ds/program/$f" 2>/dev/null || true; done
+        rm -f "$OUT/3ds/program/game.3ds" "$OUT/3ds/program/rom.txt" "$OUT/3ds/program/title.so" "$OUT/3ds/program/title.hints"
+        say "Omega Ruby and Alpha Sapphire too: $SSR_3DS_LINUX_KIT"
+    fi
     local TGZ="pokemon-ds-wide-pc-linux-${arch}.tar.gz"
     UPDATE_BUILDS+=(--build "$TGZ=$build_dir/fulldex-build-id.txt" --build "pokemon-ds-wide-pc-linux-${arch}.AppImage=$build_dir/fulldex-build-id.txt")
     tar -czf "build-pc-dist/$TGZ" -C "$dist_parent" pokemon-ds-wide

@@ -13,7 +13,7 @@ namespace GbaGlass
 // (The numbers of Glass::Icon, glass.h; gba_glass_impl.h checks that they still agree.)
 enum { IC_PLAY = 0, IC_SAVE = 1, IC_LOAD = 2, IC_CHEATS = 3, IC_FAST = 4, IC_TROPHY = 5, IC_GEAR = 6, IC_POWER = 7,
        IC_MONITOR = 9, IC_RATIO = 12, IC_EXPAND = 14, IC_FULLSCREEN = 15, IC_GRID = 16, IC_PAD = 18, IC_GAUGE = 19,
-       IC_SPARKLE = 22, IC_INFO = 23, IC_SPEAKER = 30, IC_REWIND = 31 };
+       IC_GLOBE = 11, IC_PEOPLE = 21, IC_SPARKLE = 22, IC_INFO = 23, IC_POKEBALL = 28, IC_CHIP = 29, IC_SPEAKER = 30, IC_REWIND = 31, IC_NOTE = 35 };
 enum Kind { PLAIN, TOGGLE, PICKER, LINK, SECTION, BACK, SLOT };
 enum Style { TILES, PAGE, DIALOG };
 
@@ -31,6 +31,37 @@ struct Item
     // picture (ARGB, thumbW x thumbH; none: an empty card) with `value` (when it was saved) under it.
     std::vector<uint32_t> thumb;
     int thumbW = 0, thumbH = 0;
+    int dexCard = -1; // (POKEDEX: the row's card, Page::dex, beside it)
+    int monCard = -1; // (COMPANION's PARTY: the row's Pokemon, Page::mons, beside it)
+    bool placeCard = false; // (COMPANION's LOCATION: Page::place and its map beside it)
+};
+
+// POKEDEX's card of one Pokemon, as the DS games' (ui_settings.h DexSummary): its number, name,
+// types (Generation 3 numbers), what the Pokedex says, base stats (HP, Attack, Defense, Speed,
+// Sp. Atk, Sp. Def), abilities, and its battle picture from the ROM (ARGB, normal and shiny).
+struct DexCard
+{
+    int id = 0, type1 = -1, type2 = -1, base[6] = {};
+    int state = -1; // (-1 not known, 0 not seen, 1 seen, 2 caught: the save's Pokedex)
+    std::string name, desc;
+    std::vector<std::string> abilities, evolutions;
+    std::vector<uint32_t> pic, shinyPic;
+    int picW = 0, picH = 0;
+};
+
+// COMPANION's card of one party Pokemon, as the DS games' (ui_settings.h MonSummary): name, held
+// item, level, HP and status, its picture (ARGB), types (Generation 3 numbers), nature, ability,
+// stats with IVs and EVs (HP, Attack, Defence, Speed, Sp. Atk, Sp. Def) and moves.
+struct MonCard
+{
+    std::string name, item, nature, ability;
+    int level = 0, hp = 0, maxHp = 0, status = 0, type1 = -1, type2 = -1;
+    bool egg = false;
+    std::vector<uint32_t> icon;
+    int iconW = 0, iconH = 0;
+    int stats[6] = {}, iv[6] = {}, ev[6] = {};
+    struct Move { std::string name; int type = -1, pp = 0, maxPp = 0; };
+    std::vector<Move> moves;
 };
 
 struct Page
@@ -41,6 +72,13 @@ struct Page
     bool slotGrid = false; // PAGE: its SLOT items as a grid of cards (SAVE and LOAD)
     std::string title, hint, note, headerNote;
     std::vector<Item> items; // PAGE: the first is its BACK. DIALOG: the action first, CANCEL last.
+    std::vector<DexCard> dex; // (POKEDEX: the cards the rows show, Item::dexCard)
+    std::vector<MonCard> mons; // (COMPANION's PARTY: Item::monCard)
+    // (COMPANION's LOCATION: the place, and a map (ARGB) with where you are in parts of it; -1: not known.)
+    std::string place;
+    std::vector<uint32_t> map;
+    int mapW = 0, mapH = 0;
+    float markerX = -1, markerY = -1;
     int selected = 0;
     float touchRows = 1.0f; // (phones: the rows this much larger)
 };
@@ -67,7 +105,29 @@ int Update(Page& page, const Input& in, int& dir);
 // slider: 0 to 10 when a slider's bar was tapped, else -1. pick: the choice card tapped in the
 // preview (for the chosen row), else -1.
 void Tap(Page& page, int x, int y, Input& out, int& slider, int& pick);
+// A finger on the pause menu: scrollable pages defer taps until release, so a swipe
+// scrolls without activating the row. Mouse clicks can continue to use Tap.
+enum TouchPhase { TOUCH_DOWN, TOUCH_MOVE, TOUCH_UP };
+void Touch(Page& page, TouchPhase phase, int64_t finger, int x, int y, Input& out, int& slider, int& pick);
+void CancelTouch();
 // The page drawn at w x h (ARGB, alpha as the DS menu's canvas). changed: false when it is the
 // same picture as the last call's.
 const uint32_t* Draw(const Page& page, int w, int h, bool& changed);
+
+// FULLDEX NAV (fulldex_nav.h), the DS games' quick menu, over the running GBA game: the watch with its nine apps
+// (Fly, Party, Open PC, Repel, Encounters, Reset, Map, Pokedex, Bag, in that order), drawn as the DS games draw it.
+struct Nav
+{
+    int sel = 0, count = 0, style = 0; // (style: NAV STYLE, 0 MODERN, 1 CLASSIC, 2 SIMPLE, 3 WHEEL)
+    bool centre = false;    // (the touch controls are up: WHEEL in the middle, the others at the right between R and A)
+    bool dim[9] = {};       // (an app that can't be used here, faded)
+    std::string label[9];   // (an app's word in place of its name: RESET's "A again")
+    std::string hint;
+};
+// The watch at the window's size (w x h ARGB, see-through but for it); changed: drawn again since the last.
+const uint32_t* NavDraw(const Nav& nav, int w, int h, bool& changed);
+// The app at x, y (0 to 8); -1 off the watch, -2 on it but not on an app.
+int NavHit(const Nav& nav, int w, int h, int x, int y);
+// ENCOUNTERS shown on the picture while playing: the count alone, in its corner.
+const uint32_t* NavCount(int count, int w, int h, bool& changed);
 }

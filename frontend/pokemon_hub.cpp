@@ -280,6 +280,9 @@ bool Save::ReadOnly() const { return d->readOnly; }
 int Save::Boxes() const { return d->sav->maxBoxes(); }
 std::string Save::BoxName(int box) const { return d->sav->boxName((u8)box); }
 bool Save::Changed() const { return d->changed; }
+bool Save::DexSeen(int species) const { return species > 0 && species <= MaxSpecies() && d->sav->dexSeenSpecies(pksm::Species{(u16)species}); }
+bool Save::DexCaught(int species) const { return species > 0 && species <= MaxSpecies() && d->sav->dexCaughtSpecies(pksm::Species{(u16)species}); }
+int Save::MaxSpecies() const { return (int)u16(d->sav->maxSpecies()); }
 
 std::vector<Mon> Save::Box(int box) const
 {
@@ -417,6 +420,8 @@ void Put(Save& s, const pksm::PKX& pk, int box, int slot)
         s.d->sav->fixParty();
     }
     else s.d->sav->pkm(pk, (u8)box, (u8)slot, true);
+    // (#185: in the game's Pokedex, seen and caught, as a trade in the game does.)
+    if (!pk.egg()) s.d->sav->dex(pk);
     s.d->changed = true;
 }
 void Take(Save& s, int box, int slot)
@@ -501,6 +506,7 @@ bool Evolve(Save& save, int box, int slot, std::string& error)
     auto pk = save.d->At(box, slot);
     Evolve(*pk, *EvolutionFor(*pk, *save.d->sav), save.Generation());
     save.d->sav->pkm(*pk, (u8)box, (u8)slot, false);
+    save.d->sav->dex(*pk); // (the evolved form, in the Pokedex too)
     save.d->changed = true;
     return true;
 }

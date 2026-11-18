@@ -193,9 +193,11 @@ std::string InstallHomeIcons(const std::vector<Launcher::Game>& games)
     std::string error;
     const int made = SwitchForwarder::Install(g_self, entries, error);
     fprintf(stderr, "[switch] HOME Menu icons: %d of %d%s%s\n", made, (int)entries.size(), error.empty() ? "" : ", ", error.c_str());
-    if (made == (int)entries.size()) return std::to_string(made) + " ON THE HOME MENU";
-    if (made > 0) return std::to_string(made) + " OF " + std::to_string(entries.size()) + " (" + error + ")";
-    return "FAILED: " + error;
+    // (Short, as the row has room for: the longer "8 ON THE HOME MENU" ran over the row's name.
+    // What went wrong is in game.log, above. Each said in the list's language: "8" + " ADDED".)
+    if (made == (int)entries.size()) return std::to_string(made) + " ADDED";
+    if (made > 0) return "SOME FAILED (SEE GAME.LOG)";
+    return "FAILED (SEE GAME.LOG)";
 }
 #endif
 
@@ -848,7 +850,7 @@ int PickGame(const std::vector<Launcher::Game>& gamesIn, int selected, const std
                     }
                     else if (item == 2) { F.kbFor = 0; F.text = Launcher::ShortName(g); F.dialog = 3; F.drow = 0; kbLayer = 0; kbBuild(); }
                     else if (item == 3) { F.dialog = 4; F.drow = 0; }
-                    else if (item == 4 && g.platform == Launcher::N3DS) note = "3DS SAVES ARE KEPT IN THE GAME'S OWN FOLDER";
+                    else if (item == 4 && g.platform == Launcher::N3DS) { N3ds::SyncSave(g, SavePath(g)); Launcher::OpenSaves(g, SavePath(g)); }
                     else if (item == 4) Launcher::OpenSaves(g, SavePath(g)); // (Manage Saves: a page of its own, saves_page.h)
                     else if (item == 5) Launcher::OpenAddToTab(g.rom);
                     else if (item == 6) { F.dialog = 1; F.drow = 0; }
@@ -1101,6 +1103,11 @@ int PickGame(const std::vector<Launcher::Game>& gamesIn, int selected, const std
             const char* hint = page.group < 0 ? "UP / DOWN: CHOOSE    A: OPEN    B: BACK" : "UP / DOWN: CHOOSE    LEFT / RIGHT / A: CHANGE    B: BACK";
             std::string setNow = std::to_string(page.group) + "/" + std::to_string(page.selected) + "/" + std::to_string(keysOpen) + "/";
             for (const std::string& l : page.lines) setNow += l + "\n";
+            // (And what the rows that do something say: HOME MENU ICONS' INSTALLING... and its
+            // result are not settings lines, and the page was not drawn again for them: the
+            // icons were made but the row still said INSTALL, as if nothing happened (#170).)
+            for (const Launcher::Setting& it : page.items)
+                if (it.key && it.key[0] == '!' && !it.values.empty()) setNow += it.values[0].second + "\n";
             if (Launcher::Glassy(canvas) && !keysOpen && setNow == setKey) {}
             else if (Launcher::Glassy(canvas))
             {
@@ -1278,6 +1285,8 @@ static void MoveSavesIn(const std::string& folder)
 // (name: another save of the game's folder, e.g. a hack's game's: Launcher::AdoptHackSaves.)
 static std::string SavePathFor(const Launcher::Game& g, const std::string& name)
 {
+    // (Omega Ruby / Alpha Sapphire: where their program keeps the copy, /switch/omega-nx/saves, n3ds.h.)
+    if (g.platform == Launcher::N3DS) { mkdir((g.folder + "/saves").c_str(), 0777); return g.folder + "/saves/" + name; }
     if (!FulldexFolder(g.folder)) return g.folder + "/" + name; // (another app's folder: beside the ROM, as it was)
     mkdir((g.folder + "/saves").c_str(), 0777);
     return g.folder + "/saves/" + name;
@@ -1368,6 +1377,14 @@ std::vector<Launcher::Game> FindGames(const std::string& dir, bool& ownFolder)
     Launcher::AdoptHackSaves(games, SavePathFor);
     // Omega Ruby and Alpha Sapphire: the FullDex Builder's folders in /switch (n3ds.h).
     N3ds::AddSwitch(games);
+    // (Their saves: a copy beside the game's folder kept the same as the game's own, n3ds.h.)
+    for (Launcher::Game& g : games)
+        if (g.platform == Launcher::N3DS)
+        {
+            g.saveName = N3ds::SaveName(g.code);
+            N3ds::SyncSave(g, SavePath(g));
+            g.hasSave = N3ds::IsFile(SavePath(g));
+        }
     Launcher::AddComingSoon(games);
     N3ds::DropPlaceholders(games);
     Launcher::Sort(games);
@@ -1421,6 +1438,7 @@ extern "C" void userAppExit(void)
 // (FULLDEX_RETURN), so that quitting the game from its menu brings the list back.
 static bool Start3ds(const Launcher::Game& g)
 {
+    N3ds::SyncSave(g, SavePath(g), true); // (a save brought in since the list was made, into the game; a backup)
     if (!envHasNextLoad())
     {
         fprintf(stderr, "[3ds] cannot start another program from here (no homebrew loader)\n");
@@ -1704,7 +1722,7 @@ bool Start(int& argc, char**& argv)
     // The settings: settings.cfg beside the game (ssrecomp.cfg before; an old one is renamed).
     const std::string cfgPath = SettingsPath(dir);
     g_args = { argc > 0 && argv[0] ? argv[0] : "pokemon-ds-wide", rom, "--save", SavePath(game), "--fullscreen",
-               "--config", cfgPath };
+               "--config", cfgPath, "--cloud-dir", dir };
     if (game.hack) g_args.push_back("--rom-hack"); // (says once that widescreen is tried on it)
     // (Play From Slot, Manage Saves: the game starts from that state.)
     if (!Launcher::PlayState().empty() && game.platform == Launcher::DS && StateSlots::Exists(Launcher::PlayState())) { g_args.push_back("--state-load"); g_args.push_back(Launcher::PlayState()); }

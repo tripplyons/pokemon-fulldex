@@ -1,5 +1,7 @@
 # Pokémon Fulldex
 
+<a href="https://recomplauncher.com/game/pokemon-fulldex"><picture><source media="(prefers-color-scheme: dark)" srcset="https://recomplauncher.com/assets/press/launcher/badge-light.svg"><img alt="Get it on RecompLauncher" src="https://recomplauncher.com/assets/press/launcher/badge-dark.svg" height="48"></picture></a>
+
 **All your favourite Pokémon games on a PC (Windows and Linux), a Mac, a Steam
 Deck or other handheld PC, an Android phone, an iPhone or iPad, or a modded Nintendo Switch: one screen,
 widescreen, 60 fps, up to 4K on a PC and 720p on the Switch.** No more squinting at two tiny stacked DS screens.
@@ -54,6 +56,7 @@ DS game, presented the way it should look on a modern screen.
 | **Ruby / Sapphire** (GBA) | English (1.0, 1.1, 1.2), German, French, Spanish, Italian, Japanese | |
 | **FireRed / LeafGreen** (GBA) | English (1.0, 1.1) | |
 | **Ultra Violet** (GBA, a FireRed hack) | 1.22 | as its `.gba`, or its `.ips` patch beside a FireRed 1.0 ROM |
+| **Generation 3 Evolved** (GBA, a FireRed hack) | 1.0.22 | as its `.gba`, or its `.bps` patch beside a FireRed 1.0 ROM ([details](docs/GEN3-EVOLVED-WIDESCREEN.md)) |
 | **Omega Ruby / Alpha Sapphire** (3DS) | Every language on the cartridge | Beta: Windows, Android and Switch ([how](#omega-ruby-and-alpha-sapphire-3ds-beta)); Mac, iPhone and iPad coming soon |
 | **X / Y, Ultra Sun / Ultra Moon** (3DS) | | Coming soon |
 
@@ -94,6 +97,8 @@ opens the pause menu; **QUIT** there goes back to the list.
 as a DS; hold its right trigger to fast forward. On the keyboard: arrow keys,
 X/Z for A/B, S/A for X/Y, Q/W for L/R, Enter for START, Backspace for SELECT,
 the mouse for the touch screen, Left Shift to fast forward, F5 to save a state and F8 to load it.
+For DS games, **CONTROLS > KEYS AND BUTTONS > RESET GAME** can assign a reset key or controller
+button. It starts unassigned and restarts immediately; progress since your last in-game save is lost.
 The `README.txt` inside has the full list. **CONTROLS > KEYS AND BUTTONS** in the pause menu (or on
 the game list's settings page) changes any of them, including fast forward, swapping the screens,
 save state and load state, on the keyboard and on a controller (the game list follows the ones you change).
@@ -133,10 +138,20 @@ Launcher **Settings > Display** also lets you choose the **DS Screen Filter** or
 | SCREEN LAYOUT | MERGED | the one widescreen picture, or the two DS screens laid out as on other emulators |
 
 **Desktop shortcuts:** DESKTOP SHORTCUTS on the settings page puts a shortcut for each
-game on your desktop (on Linux also in your apps menu, and so in the Steam Deck's "Add a
-Non-Steam Game" list), with its box art; each starts its game straight away.
+game on your desktop (on Linux also in your apps menu), with its box art; each starts its
+game straight away. It creates every game at once; the game menu's ADD TO DESKTOP adds
+just the chosen one.
 
-**Steam Deck direct launches:** In Desktop Mode, use FullDex Settings > DESKTOP SHORTCUTS, then open Steam > Add a Game > Add a Non-Steam Game and select the generated game entries. They appear in Gaming Mode under Non-Steam and start the selected ROM directly, including hacks. Recreate shortcuts after moving a ROM. The desktop icon is included; Steam library cover artwork can be assigned separately in Steam. New Deck setups use Start for the pause menu; saved START BUTTON choices are respected.
+**Steam Deck direct launches:** In a game's menu (A on the game), choose **ADD TO STEAM**.
+FullDex writes that game into Steam's own library and starts the ROM directly, including
+hacks; the launcher itself is added from Settings > **Shortcuts** > **STEAM LAUNCHER**. Quit Steam first:
+FullDex says how to reopen it on your OS. **If Steam is not found, the same menu item
+automatically says ADD TO DESKTOP** and makes the normal desktop shortcut instead (Windows
+`.lnk`, macOS `.app`, Linux `.desktop`), so the action never dead-ends. Entries are
+user-selected; nothing is added automatically. Recreate after moving a ROM. If you switch
+Steam accounts or move Steam, Settings > **Shortcuts** > **STEAM ACCOUNT** > **REFRESH** finds the account's
+shortcuts file again. Steam library cover artwork can be assigned separately in Steam. New
+Deck setups use Start for the pause menu; saved START BUTTON choices are respected.
 
 **What it needs:** Windows 10 or 11 (64-bit), or 64-bit Linux from late 2023 on
 (Ubuntu 24.04, Fedora 39, SteamOS 3.5 or newer); nothing else to install. For WORLD
@@ -145,10 +160,11 @@ up-to-date drivers; without it, the processor draws the world (that wants a
 much faster processor).
 
 **Steam Deck:** in Desktop Mode, unpack the Linux download and put your ROMs in
-its `roms` folder; in Steam, **Games > Add a Non-Steam Game to My Library**,
-browse to `pokemon-ds-wide` (file type: All Files); then start it from your
-library in Gaming Mode with a gamepad controller layout. Set 3D RESOLUTION to
-720P for the Deck's 1280x800 screen.
+its `roms` folder. Quit Steam. Open Fulldex from your apps menu; add the launcher from
+Settings > **Shortcuts** > **STEAM LAUNCHER**, or one game from its menu (A on the game) > **ADD TO STEAM**.
+The game menu says **ADD TO DESKTOP** instead when Steam is not found (automatic fallback).
+Start Steam again; then start FullDex or the game from your library in Gaming Mode with a
+gamepad controller layout. Set 3D RESOLUTION to 720P for the Deck's 1280x800 screen.
 
 **Mac** (macOS 11 or newer):
 
@@ -257,7 +273,7 @@ in busy places.
 | Setting | Recommended | What it does |
 |---|---|---|
 | 60 FPS | ON | in-between frames: the games draw their 3D at 30 fps |
-| BATTLE BUTTONS | PANEL | Black 2, White 2, Black and White: the game's own FIGHT, BAG, RUN and POKÉMON panel beside the battle (Black and White also have STRIP: large buttons in the message box) |
+| BATTLE BUTTONS | PANEL | Black 2, White 2, Black and White: the game's own FIGHT, BAG, RUN and POKÉMON panel beside the battle (STRIP, the default, puts them on the message box as rounded buttons, like the moves) |
 | WORLD DETAIL | 720 | lines the wide world is drawn with (540 if you want headroom) |
 | LOWER DETAIL WHEN BUSY | OFF | ON: fewer lines for a moment instead of slowing down |
 
@@ -289,8 +305,23 @@ Razer Kishi and others) plays as a DS and hides the on-screen buttons; its
 AND BUTTONS** in the pause menu (and on the game list) changes which button does what,
 including fast forward, swapping the screens, save state and load state.
 
-**Saves** go in a `saves` folder inside your ROMs folder (made for you). The
-settings and `game.log` are in `Android/data/io.github.mamesj.pokemonds/files`.
+**Saves:** the location depends on how your ROMs were added and any folder settings
+you have changed. A shared ROM folder normally has a `saves` folder; imported ROMs
+can use FullDex's app folder under `Android/data/io.github.mamesj.pokemonds/files`,
+which Android file managers may not let you open. Changing the ROM folder does not
+move existing saves.
+
+For saves you can open in a file manager or another emulator, return to the game
+list and open **Settings > Game List > Saves Folder**. Choose a folder on the
+device's shared storage, such as `Documents/FullDex Saves`, and allow the requested
+file access. FullDex copies the current saves there without replacing files already
+in that folder; the old copies stay where they were. If the destination already
+contains a save with the same name, check which copy you want to use before playing.
+If Android will not grant access to the chosen location, choose another folder on
+the device's storage.
+
+The app's startup settings and `game.log` are normally in
+`Android/data/io.github.mamesj.pokemonds/files`.
 
 **What it needs:** Android 7.0 or newer on a 64-bit phone. The 3D world is drawn
 by the processor at 720P to start (3D RESOLUTION in the settings: Y in the list,
@@ -375,11 +406,32 @@ controller, or SETTINGS at the top), or in the pause menu while you play (**Esc*
 | CONTROLS | **KEYS AND BUTTONS** (give any DS button, the pause menu, fast forward, swapping the screens, save state or load state another key or controller button), START BUTTON, BUTTONS, STICK TOUCH CURSOR |
 | SHORTCUTS | DESKTOP SHORTCUTS (PC), HOME MENU ICONS (Switch): a shortcut for each game |
 
+For DS games, **Settings → Playback → AUTO SAVE STATE** optionally keeps a separate
+state every minute, when the app goes into the background and when it exits normally.
+**RESUME ON START** optionally loads that ROM's automatic state on the next start.
+FullDex's embedded GBA player offers the same two options in **Settings → Controls**;
+the choices are shared between DS and GBA, with separate state files for each ROM.
+Both are off by default. Automatic states use the states folder, have a separate
+filename based on the ROM's full CRC and size, and retain the previous successful
+state. Manual slots and the normal in-game save are kept separately. Continue saving
+in the game too: an automatic state is not an in-game save or a cloud backup.
+An invalid automatic state starts normally and pauses automatic writes for that
+session so the damaged file can be recovered; turn resume off to start normally.
+This feature currently covers DS and FullDex's embedded GBA player, not 3DS. Mobile lifecycle behavior
+still depends on the operating system giving the app time to finish writing.
+
 The pause menu also has RESUME, SAVE STATE, LOAD STATE, FAST FORWARD, CHEATS
 ([below](#cheats)), RETROACHIEVEMENTS ([below](#retroachievements)), RESET GAME and QUIT
 (back to the game list). LOAD STATE takes you back to where the state was made but leaves your
 in-game save as it is; saving in the game afterwards writes over it as usual. Not every platform has
 every setting: a phone and the Switch are always full screen, for one.
+
+GBA state slots are replaced only after the new state has been written and closed
+successfully. The previous successful state stays beside the slot as `.ss.previous`;
+an interrupted or failed write stays as `.ss.pending` without replacing the slot.
+If saving fails, keep these files for recovery, check disk space and folder permissions,
+and move the pending file aside before retrying. Close the game before restoring a
+previous state file. These state files are separate from the normal `.sav` save.
 
 ### RetroAchievements
 
@@ -408,7 +460,7 @@ cartridge. Copy it in under the game's name, in this folder:
 | PC (Windows, Linux, Steam Deck) | the `saves` folder beside the program |
 | Linux AppImage | `~/.local/share/pokemon-ds-wide/saves` |
 | Mac | `~/Library/Application Support/Pokemon DS Widescreen/saves` |
-| Android | the `saves` folder inside the folder you chose for your ROMs |
+| Android | your configured **Saves Folder**; otherwise a `saves` folder in the ROM/app folder (see the Android guide above) |
 | iPhone and iPad | Files app: On My iPhone (or iPad) > Pokémon Fulldex > `saves` |
 | Nintendo Switch | `/switch/pokemon-ds-wide/saves/` on the SD card |
 
@@ -701,9 +753,24 @@ version and the **`game.log`** file, which says what the program did:
    as ftpd over Wi-Fi.
 3. **Add it to the form:** drag the file into the `game.log` box.
 
-A screenshot or short video helps too. Please never attach your ROM. A white or A white or black screen when a game starts usually means the ROM isn't one in
+A screenshot or short video helps too. Please never attach your ROM. A white or black screen when a game starts usually means the ROM isn't one in
 [Supported games](#supported-games), or has been changed (patches, translations, randomizers
 or trimming).
+
+## Custom touch controls and regional profiles
+
+Android players can move and resize on-screen controls in the paused layout editor.
+The launcher and Fulldex menus offer AUTO, English, Spanish, Italian, French, German, Japanese and Korean interface languages. Embedded GBA menus follow the launcher language too. See [controls, regional games and build notes](docs/REGIONAL-AND-TOUCH-CONTROLS.md).
+
+### Open a DS game from an Android frontend
+
+A frontend or file manager can send an Android VIEW intent for an `.nds` ROM to FullDex. A readable file opens directly. Document-provider links are copied into FullDex storage before launch, so they also work when the provider exposes no ordinary file path; the original file is unchanged. Existing save-folder settings and save checks are retained. While FullDex is already showing its library, a new link starts the selected game. Quit an active game before opening another link. This integration still needs testing with individual frontends and devices.
+
+### Android folders without ordinary file access
+
+Granting all-files access lets FullDex use a shared ROM folder directly. If that permission is declined, or a document provider exposes no filesystem path, choosing a folder imports its `.nds` and `.gba` files into FullDex storage instead. The app shows when it is importing and how many ROMs were found. Nested folders are supported; choose a smaller folder if a traversal/size limit is reached. Original files remain untouched. These are separate ROM copies: changes made by another emulator are not automatically synchronised, and source saves are not imported automatically. Existing FullDex save locations are retained and must remain accessible. This fallback needs testing on affected GrapheneOS devices.
+
+ROM imports reuse identical files and refuse to overwrite a different ROM with the same filename. Rename the incoming ROM or choose its existing ROM folder instead. An explicitly imported save still gets a safety backup before replacement.
 
 ## Support
 
@@ -716,20 +783,30 @@ Tips are welcome but never expected:
 A fork of [ClickingMaster/ssrecomp](https://github.com/ClickingMaster/ssrecomp)
 (Pokémon SoulSilver recompiled for single-screen devices), which gave this its
 single-screen and widescreen view; [its README](docs/original-ssrecomp-README.md)
-covers that project. Function names come from the
-[pokebw2](https://github.com/fuddlesworth/pokebw2) and
-[aletheia](https://github.com/Project-Holon/aletheia) decompilations (only their
-symbol files), Platinum's from a build of
-[pret/pokeplatinum](https://github.com/pret/pokeplatinum); SoulSilver's and HeartGold's
-addresses come from ssrecomp's own SoulSilver layout. The DS is emulated by [melonDS](https://melonds.kuribo64.net).
-The built-in DS cheats come from DeadSkullzJr's cheat database, as carried in
-[libretro-database](https://github.com/libretro/libretro-database).
-The Switch's HOME MENU ICONS are made the way [sphaira](https://github.com/ITotalJustice/sphaira)
-makes its forwarders, with its homebrew loader (`tools/switch/forwarder`, GPL-3.0, based on
-nx-hbloader). The GBA games are played by Pokémon GBA Widescreen, built on
-[mGBA](https://mgba.io) (MPL-2.0: `LICENSE-mGBA.txt` in the downloads that have the GBA games).
+covers that project.
 
-GPL-3.0-or-later (see `LICENSE`), as required by melonDS. Not affiliated with
+Based on PokeDaisy by Lidor Itzhari - https://github.com/lidor30/pokedaisy
+
+- **Companion, OPEN PC and FLY:** PokéDaisy's readers, data and DS field actions (GPL-3.0).
+- **DS emulation:** [melonDS](https://melonds.kuribo64.net).
+- **GBA games:** Pokémon GBA Widescreen, built on [mGBA](https://mgba.io) (MPL-2.0:
+  `LICENSE-mGBA.txt` in the downloads that have the GBA games).
+- **Function names:** the [pokebw2](https://github.com/fuddlesworth/pokebw2) and
+  [aletheia](https://github.com/Project-Holon/aletheia) decompilations (only their symbol
+  files), Platinum's from a build of [pret/pokeplatinum](https://github.com/pret/pokeplatinum);
+  SoulSilver's and HeartGold's addresses come from ssrecomp's own SoulSilver layout.
+- **DS cheats:** DeadSkullzJr's cheat database, as carried in
+  [libretro-database](https://github.com/libretro/libretro-database).
+- **Moving Pokémon between games:** [PKSM-Core](https://github.com/FlagBrew/PKSM-Core) by FlagBrew (GPL-3.0).
+- **Switch HOME MENU ICONS:** made the way [sphaira](https://github.com/ITotalJustice/sphaira)
+  makes its forwarders, with its homebrew loader (`tools/switch/forwarder`, GPL-3.0, based on
+  nx-hbloader).
+- **Fonts:** Noto Sans CJK (SIL OFL 1.1, `LICENSE-Noto.txt`) and the launcher's fonts (SIL OFL 1.1,
+  `frontend/fonts/FONT-LICENSES.txt`).
+- **Translations:** see [localisation](localisation/README.md), including AlessioGiacobbe's
+  Italian improvements.
+
+GPL-3.0-or-later (see `LICENSE` and `NOTICE`), as required by melonDS. Not affiliated with
 or endorsed by Nintendo, Game Freak, The Pokémon Company or the melonDS
 project; Pokémon is a trademark of its owners. The box art in the PC game list belongs to
 Nintendo, Creatures, GAME FREAK and The Pokémon Company and is shown only to tell the games
@@ -739,20 +816,3 @@ open an issue and it will be taken out.
 ---
 
 Built with AI assistance.
-
-## Custom touch controls and regional profiles
-
-Android players can move and resize on-screen controls in the paused layout editor.
-The launcher and Fulldex menus offer AUTO, English, Spanish, Italian, French, German, Japanese and Korean interface languages. Embedded GBA menus follow the launcher language too. See [controls, regional games and build notes](docs/REGIONAL-AND-TOUCH-CONTROLS.md).
-
-Companion additions: Based on PokeDaisy by Lidor Itzhari - https://github.com/lidor30/pokedaisy
-
-### Open a DS game from an Android frontend
-
-A frontend or file manager can send an Android VIEW intent for an `.nds` ROM to FullDex. A readable file opens directly. Document-provider links are copied into FullDex storage before launch, so they also work when the provider exposes no ordinary file path; the original file is unchanged. Existing save-folder settings and save checks are retained. While FullDex is already showing its library, a new link starts the selected game. Quit an active game before opening another link. This integration still needs testing with individual frontends and devices.
-
-### Android folders without ordinary file access
-
-Granting all-files access lets FullDex use a shared ROM folder directly. If that permission is declined, or a document provider exposes no filesystem path, choosing a folder imports its `.nds` and `.gba` files into FullDex storage instead. The app shows when it is importing and how many ROMs were found. Nested folders are supported; choose a smaller folder if a traversal/size limit is reached. Original files remain untouched. These are separate ROM copies: changes made by another emulator are not automatically synchronised, and source saves are not imported automatically. Existing FullDex save locations are retained and must remain accessible. This fallback needs testing on affected GrapheneOS devices.
-
-ROM imports reuse identical files and refuse to overwrite a different ROM with the same filename. Rename the incoming ROM or choose its existing ROM folder instead. An explicitly imported save still gets a safety backup before replacement.

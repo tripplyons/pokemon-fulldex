@@ -1,5 +1,7 @@
 #include <chrono>
+#include "folders.h"
 #include "picture_browser.h"
+#include "linux_folder_picker.h"
 // The PC all-games program's game list. See pc_launcher.h.
 #ifdef SSR_PC_LAUNCHER
 #include "pc_launcher.h"
@@ -61,8 +63,33 @@
 #ifdef SSR_IOS
 #include "ios_orient.h"
 #endif
+#ifdef SSR_IOS
+// The list is drawn inside the screen's safe area (#153): its tabs were under the Dynamic Island.
+// Insets in window points; taps are moved by them as they arrive, and the list's own window size
+// is the safe area's.
+static int g_safeL = 0, g_safeT = 0, g_safeR = 0, g_safeB = 0;
+static int SafeAreaFilter(void*, SDL_Event* e)
+{
+    if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP) { e->button.x -= g_safeL; e->button.y -= g_safeT; }
+    else if (e->type == SDL_MOUSEMOTION) { e->motion.x -= g_safeL; e->motion.y -= g_safeT; }
+    return 1;
+}
+static void ListWindowSize(SDL_Window* w, int* ww, int* wh)
+{
+    SDL_GetWindowSize(w, ww, wh);
+    *ww = std::max(1, *ww - g_safeL - g_safeR);
+    *wh = std::max(1, *wh - g_safeT - g_safeB);
+}
+// The list's own keyboard (dialog 3): typed text from a hardware keyboard too, but on iOS no
+// system keyboard over it (ios_orient.h, IosHardwareKeyboard).
+static void StartListKeyboard() { if (IosHardwareKeyboard()) SDL_StartTextInput(); }
+#else
+static void ListWindowSize(SDL_Window* w, int* ww, int* wh) { SDL_GetWindowSize(w, ww, wh); }
+static void StartListKeyboard() { SDL_StartTextInput(); }
+#endif
 #if !defined(SSR_PHONE) && !defined(__SWITCH__)
 #include "shortcuts.h"
+#include "steam_shortcuts.h"
 #endif
 #ifdef SSR_UPDATER
 #include "updater.h"
@@ -87,7 +114,7 @@ namespace
 {
 std::vector<std::string> g_args;
 std::vector<char*> g_argv;
-bool g_canChange = false, g_change = false;
+bool g_canChange = false, g_change = false, g_direct = false; // (g_direct: started for one game, #196)
 std::string g_name;
 
 bool Exists(const std::string& path)
@@ -145,36 +172,6 @@ bool ConfigFullscreen(const std::string& cfg, int& w, int& h)
 }
 
 // F11 in the list: the game then starts the same way (the settings file says so).
-// Lines of the settings file set (key=value) or, for an empty value, taken out; the others kept.
-void SetConfigValues(const std::string& cfg, const std::vector<std::pair<std::string, std::string>>& values)
-{
-    std::vector<std::string> lines;
-    if (FILE* f = fopen(cfg.c_str(), "r"))
-    {
-        char line[1024];
-        while (fgets(line, sizeof line, f))
-        {
-            std::string l = line;
-            while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
-            bool set = false;
-            for (const auto& kv : values) set |= l.size() > kv.first.size() && !l.compare(0, kv.first.size(), kv.first) && l[kv.first.size()] == '=';
-            if (!set) lines.push_back(l);
-        }
-        fclose(f);
-    }
-    for (const auto& kv : values)
-        if (!kv.second.empty()) lines.push_back(kv.first + "=" + kv.second);
-    const std::string tmp = cfg + ".tmp";
-    if (FILE* f = fopen(tmp.c_str(), "w"))
-    {
-        bool ok = true;
-        for (const std::string& l : lines) if (fprintf(f, "%s\n", l.c_str()) < 0) ok = false;
-        ok = fclose(f) == 0 && ok;
-        std::error_code ec;
-        if (ok) std::filesystem::rename(tmp, cfg, ec);
-        if (!ok || ec) fprintf(stderr, "[launcher] settings could not be saved: %s\n", cfg.c_str());
-    }
-}
 
 void SetConfigFullscreen(const std::string& cfg, bool on)
 {
@@ -203,10 +200,25 @@ void SetConfigFullscreen(const std::string& cfg, bool on)
     }
 }
 
+struct Folders;
+void ResolveFolders(Folders& fo, bool atStart);
+bool OwnSavesFolder(const Folders& fo);
+std::string FoldersShown(const Folders& fo);
+std::string SwitchFolders(Folders& fo, const std::vector<Launcher::Game>& games);
+std::string& PendingPick();
+std::string OwnFolderShown(const Folders& fo, const char* key);
+std::string UseOwnFolder(Folders& fo, const std::string& kind, const std::string& dir, const std::vector<Launcher::Game>& games);
+std::string PickAnyFolder(SDL_Window* window, const std::string& kind);
 struct Folders
 {
     std::string dir, roms, saves, funcs, cfg;
+    // FOLDERS (folders.h): the save states ("": beside each save), the cheats ("": beside the saves
+    // folder), FullDex's own settings files (the saves folder, as before, in the classic layout).
+    std::string states, cheats, settings;
     std::string art; // where the list's own pictures are (icons/IREO.jpg ...)
+    // Linux AppImage: the folder the AppImage itself is in. ROMs put there, or in a roms folder
+    // beside it (as the download's own folder is used on Windows), are found too (#150).
+    std::string besideApp;
 };
 
 #ifdef __ANDROID__
@@ -291,6 +303,26 @@ bool JavaBoolStringArg(const char* method, const std::string& value)
         env->DeleteLocalRef(s);
     });
     return out;
+}
+// (A static method taking a string and giving one, or giving nothing.)
+std::string JavaStringStringArg(const char* method, const std::string& value)
+{
+    std::string out;
+    CallActivity(method, "(Ljava/lang/String;)Ljava/lang/String;", [&](JNIEnv* env, jclass c, jmethodID m) {
+        jstring s = env->NewStringUTF(value.c_str());
+        jstring res = (jstring)env->CallStaticObjectMethod(c, m, s);
+        env->DeleteLocalRef(s);
+        if (res) { if (const char* t = env->GetStringUTFChars(res, nullptr)) { out = t; env->ReleaseStringUTFChars(res, t); } env->DeleteLocalRef(res); }
+    });
+    return out;
+}
+void JavaVoidStringArg(const char* method, const std::string& value)
+{
+    CallActivity(method, "(Ljava/lang/String;)V", [&](JNIEnv* env, jclass c, jmethodID m) {
+        jstring s = env->NewStringUTF(value.c_str());
+        env->CallStaticVoidMethod(c, m, s);
+        env->DeleteLocalRef(s);
+    });
 }
 
 // The ROM folder the player chose (GameActivity.romFolder), with the saves in a folder inside
@@ -489,6 +521,19 @@ std::string HacksFolder(const Folders& fo)
     return (fo.dir.empty() ? std::string(".") : fo.dir) + "/hacks";
 }
 
+// AppImage only: the folder the AppImage is in and a roms folder there (the ones that exist).
+std::vector<std::string> BesideAppFolders(const Folders& fo)
+{
+    std::vector<std::string> out;
+    if (fo.besideApp.empty()) return out;
+    std::error_code ec;
+    for (const std::string& d : {fo.besideApp + "/roms", fo.besideApp + "/ROMs", fo.besideApp})
+        if (std::filesystem::is_directory(std::filesystem::u8path(d), ec) &&
+            std::find(out.begin(), out.end(), d) == out.end())
+            out.push_back(d);
+    return out;
+}
+
 // The ROMs in the roms folder (and any left beside the program), their saves in saves/.
 std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, std::vector<uint32_t>>& artCache)
 {
@@ -496,7 +541,7 @@ std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, s
     std::set<std::string> seen;
     // (Each DS ROM checked against the clean releases, in the background the first time: a hack
     // gets a save of its own. romhacks.h)
-    Launcher::BeginScan(fo.saves);
+    Launcher::BeginScan(fo.settings);
     // A picture of the player's own (icons/IREO.jpg, or Black 2.jpg beside Black 2.nds), read once.
     auto artFor = [&](Launcher::Game& g) {
         auto it = artCache.find(g.rom);
@@ -515,6 +560,9 @@ std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, s
     };
     std::vector<std::string> romDirs = RomLibrary::Folders(fo.roms, HacksFolder(fo));
     if (std::find(romDirs.begin(), romDirs.end(), fo.dir) == romDirs.end()) romDirs.push_back(fo.dir);
+    // (AppImage: the ROMs beside it and in a roms folder beside it, #150.)
+    for (const std::string& extra : BesideAppFolders(fo))
+        if (std::find(romDirs.begin(), romDirs.end(), extra) == romDirs.end()) romDirs.push_back(extra);
     for (const std::string& dir : romDirs)
     {
         if (dir.empty()) continue;
@@ -541,7 +589,7 @@ std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, s
         const size_t before = games.size();
         Launcher::AddPatchedHacks(romDirs, HacksFolder(fo), fo.saves, games, false);
         for (size_t i = before; i < games.size(); i++) artFor(games[i]);
-        Launcher::AdoptHackSaves(games, [](const Launcher::Game& g, const std::string& name) { return g.folder + "/" + name; });
+        Launcher::AdoptHackSaves(games, [&fo](const Launcher::Game&, const std::string& name) { return fo.saves + "/" + name; });
     }
     Launcher::EndScan();
 #ifdef SSR_GBA
@@ -561,6 +609,8 @@ std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, s
         GbaGames::Add(sub, fo.saves, games, artCache);
     }
     if (!fo.dir.empty() && fo.dir != fo.roms) GbaGames::AddWithGbaFolder(fo.dir, fo.saves, games, artCache);
+    for (const std::string& extra : BesideAppFolders(fo))
+        if (extra != fo.roms && extra != fo.dir) GbaGames::AddWithGbaFolder(extra, fo.saves, games, artCache);
     {
         std::set<std::string> seenRom;
         std::vector<Launcher::Game> gba;
@@ -584,7 +634,7 @@ std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, s
             fprintf(stderr, "[launcher] GBA games: %zu in %s\n", gbaSeen, fo.roms.c_str());
     }
 #endif
-#ifdef _WIN32
+#ifdef SSR_N3DS_PC
     // Omega Ruby and Alpha Sapphire: a dump (.3ds) with the ROMs, played by the 3ds folder's program.
     N3ds::AddPc(romDirs, fo.dir, games);
     for (Launcher::Game& g : games)
@@ -595,6 +645,14 @@ std::vector<Launcher::Game> FindGames(const Folders& fo, std::map<std::string, s
     for (Launcher::Game& g : games)
         if (g.platform == Launcher::N3DS) g.built = JavaBoolStringArg("threeDsBuilt", N3ds::IdOf(g));
 #endif
+    // (Their saves: the copy in the saves folder and the game's own kept the same, n3ds.h.)
+    for (Launcher::Game& g : games)
+        if (g.platform == Launcher::N3DS)
+        {
+            g.saveName = N3ds::SaveName(g.code);
+            N3ds::SyncSave(g, fo.saves + "/" + g.saveName);
+            g.hasSave = N3ds::IsFile(fo.saves + "/" + g.saveName);
+        }
     Launcher::AddComingSoon(games);
     N3ds::DropPlaceholders(games);
     for (Launcher::Game& g : games)
@@ -792,6 +850,13 @@ static void FillUpdateStatus()
 
 int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool& fullscreen, int winW, int winH)
 {
+#if !defined(SSR_PHONE) && !defined(__SWITCH__)
+    // The Steam account/shortcuts path is found once at load and kept in settings.cfg; the
+    // game menu's label is drawn every frame and must not touch Steam's folders there.
+    SteamShortcuts::Initialize(fo.cfg);
+    Launcher::PlatformEntryLabel() = [dir = fo.dir](const Launcher::Game& g) { return SteamShortcuts::PlatformEntryLabel(dir, g); };
+    Launcher::PlatformLauncherState() = [] { return SteamShortcuts::HasLauncher() ? "IN STEAM" : "NOT IN STEAM"; };
+#endif
 #ifdef __ANDROID__
     JavaVoid("showLauncherOrientation");
     SDL_SetHint(SDL_HINT_ORIENTATIONS, "LandscapeLeft LandscapeRight Portrait PortraitUpsideDown");
@@ -885,13 +950,27 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
     // The tab shown (Launcher::TABS: ALL first, the list opens on it; back from a GBA game, the
     // tab it was chosen on) and how far down it is scrolled. selected: a game in that tab, or -1
     // when it has none.
-    Launcher::LoadTabs(fo.saves);
+    Launcher::LoadTabs(fo.settings);
     static int lastTab = std::max(0, std::min(Launcher::TabCount() - 1, atoi(Launcher::ConfigValue(fo.cfg, "launcher_tab2").c_str())));
     int tab = lastTab, scroll = 0, result = -1;
     // false while the list is where a finger (or the mouse, held) dragged it, rather than where
     // the chosen game is; a key, button or tap that chooses a game makes it follow again.
     bool follow = true;
     std::string note;
+    bool noteKeep = false; // (a menu action's message survives the pointer-up that follows it)
+    if (Launcher::ConfigValue(fo.cfg, "folders_moved") == "1")
+    {
+        note = "FOLDERS TIDIED: SAVES, STATES, CHEATS AND SETTINGS EACH HAVE ONE. SETTINGS TO UNDO.";
+        SetConfigValues(fo.cfg, { { "folders_moved", "shown" } });
+    }
+    // (A 3DS file with the ROMs that is not listed: why, #155.)
+    if (note.empty() && !N3ds::SkipNote().empty()) note = N3ds::SkipNote();
+    if (getenv("SSR_TEST_FOLDERS_SWITCH")) note = SwitchFolders(fo, games); // (tests: the FOLDERS option chosen once)
+    if (const char* own = getenv("SSR_TEST_OWN_FOLDER")) // (tests: "kind|folder", as if chosen in the picker)
+    {
+        const std::string v = own; const size_t bar = v.find('|');
+        if (bar != std::string::npos) note = UseOwnFolder(fo, v.substr(0, bar), v.substr(bar + 1), games);
+    }
 #ifdef __ANDROID__
     auto chooseRomFolder = [&]() {
         // Pin an established save location before an import can fill storage or change the ROM root.
@@ -915,19 +994,19 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
     LibraryHistory library;
     auto reorderLibrary=[&]() {
         const std::string keep=selected>=0 && selected<(int)games.size()?games[selected].rom:"";
-        library.Load(fo.saves+"/fulldex-library.txt");
-        Launcher::ApplyLocal(games, fo.saves); // (the player's names; the games taken off the list left out)
-        Launcher::ApplyArt(games, fo.saves); // (the pictures chosen with Change Picture)
+        library.Load(fo.settings+"/fulldex-library.txt");
+        Launcher::ApplyLocal(games, fo.settings); // (the player's names; the games taken off the list left out)
+        Launcher::ApplyArt(games, fo.settings); // (the pictures chosen with Change Picture)
         Launcher::SortKey() = Launcher::ConfigValue(fo.cfg, "list_sort");
-        Launcher::LoadTabs(fo.saves);
+        Launcher::LoadTabs(fo.settings);
         Launcher::Sort(games);
         library.Apply(games,Launcher::ConfigValue(fo.cfg,"list_sort"));
         for(size_t i=0;i<games.size();i++)if(games[i].rom==keep)selected=(int)i;
         scroll=0;follow=true;
     };
-    Launcher::BuildRomList(games, fo.saves); // (the ROMs page: before those taken off the list are left out)
+    Launcher::BuildRomList(games, fo.settings); // (the ROMs page: before those taken off the list are left out)
     // (Twenty hours played: the one Support message. SSR_LIST_BEER: shown at once, for the test picture.)
-    if (PlayTime::AskNow(fo.saves) || getenv("SSR_LIST_BEER")) Launcher::OpenBeer();
+    if (PlayTime::AskNow(fo.settings) || getenv("SSR_LIST_BEER")) Launcher::OpenBeer();
     reorderLibrary();
     auto useRomFolder = [&](const std::string& dir) {
         std::error_code ec;
@@ -941,7 +1020,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         artCache.clear();
         games = FindGames(fo, artCache);
         selected = -1;
-        Launcher::BuildRomList(games, fo.saves);
+        Launcher::BuildRomList(games, fo.settings);
         reorderLibrary();
         selected = Launcher::FirstIn(Launcher::MakeView(canvas, games, tab));
         Launcher::Focus().prow = 0;
@@ -1000,6 +1079,19 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
     Launcher::PhoneUi() = true; // (a phone: bigger text and buttons, the Tiles layout)
 #endif
     if (getenv("SSR_LIST_PHONE")) Launcher::PhoneUi() = true; // (test)
+    // UI SIZE (ui.h): the factor, on every device. Above 100% (a handheld's small screen, by
+    // default) on one that is not a phone or the Switch: the phone's layouts, which fit a short
+    // screen with larger writing, at that size; those two have them already.
+    {
+        SDL_DisplayMode dm{};
+        const int screenH = SDL_GetDesktopDisplayMode(0, &dm) == 0 && dm.h > 0 ? dm.h : canvas.h;
+        UiScale() = UiScaleFor(Launcher::ConfigValue(fo.cfg, "ui_size"), screenH);
+#if !defined(SSR_PHONE) && !defined(__SWITCH__)
+        Launcher::LargeUi() = UiScale() > 1.0f;
+        if (Launcher::LargeUi()) Launcher::PhoneUi() = true;
+        else if (!getenv("SSR_LIST_PHONE")) Launcher::PhoneUi() = false; // (UI SIZE set back to 100%)
+#endif
+    }
 #ifdef __SWITCH__
     Launcher::PhoneUi() = true; // (the Switch: the same bigger text and buttons as a phone, so the menus read in handheld)
 #endif
@@ -1047,11 +1139,13 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
     {
         Launcher::HubLoad();
         Launcher::HubState& H = Launcher::Hub();
-        Launcher::HubMode() = !strncmp(hb, "trade", 5) ? 2 : !strncmp(hb, "move", 4) || !strcmp(hb, "top") ? 0 : 1;
+        Launcher::HubMode() = !strncmp(hb, "trade", 5) ? 2 : !strncmp(hb, "move", 4) || !strcmp(hb, "top") || !strcmp(hb, "dextop") ? 0 : 1;
+        // (dex[:row]: COMBINED POKEDEX open on a region; dextop: the Hub's first page on its row.)
+        if (!strncmp(hb, "dex", 3)) { Launcher::HubMode() = strcmp(hb, "dextop") ? 4 : 0; Launcher::Focus().prow = strcmp(hb, "dextop") ? (strchr(hb, ':') ? atoi(strchr(hb, ':') + 1) : 0) : 4; }
         if (!strcmp(hb, "tradehost")) Launcher::TradeDo(2, 0);
         if (!strcmp(hb, "tradejoin")) Launcher::TradeDo(2, 1);
         if (!strcmp(hb, "tradeguide")) Launcher::TradeDo(2, 4);
-        if (!strncmp(hb, "trade", 5) || !strcmp(hb, "top")) {}
+        if (!strncmp(hb, "trade", 5) || !strcmp(hb, "top") || !strncmp(hb, "dex", 3)) {}
         else if (!strncmp(hb, "move", 4))
         {
             // (move:from,to opens Move Pokemon; moved:from,to also moves the box's first Pokemon, for real, in the test folder's save copies.)
@@ -1092,6 +1186,8 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         const int gi = atoi(sv);
         if (gi >= 0 && gi < (int)games.size())
         {
+            Launcher::ConfirmHack(games, (size_t)gi, fo.settings,
+                                  [&fo](const Launcher::Game&, const std::string& name) { return fo.saves + "/" + name; });
             Launcher::OpenSaves(games[gi], fo.saves + "/" + games[gi].saveName);
             if (const char* k = strchr(sv, ',')) Launcher::Focus().pact = atoi(k + 1);
             if (const char* all = getenv("SSR_LIST_SAVESDO"))
@@ -1375,6 +1471,19 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             return;
         }
 #endif
+#if !defined(SSR_PHONE) && !defined(__SWITCH__) && !defined(__APPLE__)
+        // STEAM LAUNCHER: add or take out Fulldex itself; the value says what happened.
+        if (key && !strcmp(key, "!steam_launcher"))
+        {
+            page.items[page.selected].values[0].second = SteamShortcuts::LauncherDo();
+            return;
+        }
+        if (key && !strcmp(key, "!steam_refresh"))
+        {
+            page.items[page.selected].values[0].second = SteamShortcuts::RefreshAccount(fo.cfg);
+            return;
+        }
+#endif
 #if !defined(__ANDROID__) && !defined(SSR_IOS)
         // SAVES FOLDER: a folder of the player's own (copied into, nothing replaced), used from the next start; again: back beside the ROMs.
         if (key && !strcmp(key, "!saves_folder"))
@@ -1396,6 +1505,43 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             return;
         }
 #endif
+        // FOLDERS of the player's own: SAVE STATES, CHEATS, SETTINGS (and SAVES on a phone): chosen, or
+        // chosen again to go back to FullDex's own.
+        if (key && (!strcmp(key, "!states_folder") || !strcmp(key, "!cheats_folder") || !strcmp(key, "!settings_folder")
+#ifdef __ANDROID__
+                    || !strcmp(key, "!saves_folder")
+#endif
+                   ))
+        {
+            const std::string kind(key + 1, strlen(key) - 8), cfgKey = kind + "_folder";
+            std::string& shown = page.items[page.selected].values[0].second;
+            if (kind == "saves" ? OwnSavesFolder(fo) : !Launcher::ConfigValue(fo.cfg, cfgKey.c_str()).empty())
+            {
+                SetConfigValues(fo.cfg, { { cfgKey, "" } });
+                ResolveFolders(fo, false);
+                Launcher::LoadTabs(fo.settings);
+                Launcher::BuildRomList(games, fo.settings);
+                shown = "FULLDEX'S AGAIN (YOUR FOLDER'S FILES STAY THERE)";
+                return;
+            }
+#ifdef __ANDROID__
+            PendingPick() = kind;
+            JavaVoidStringArg("chooseFolderFor", kind);
+            shown = "CHOOSE THE FOLDER...";
+#elif defined(SSR_IOS)
+            shown = "SET " + cfgKey + "= IN SETTINGS.CFG";
+#else
+            const std::string dir = PickAnyFolder(window, kind);
+            shown = dir.empty() ? "NO FOLDER CHOSEN (NO PICKER? SET " + cfgKey + "= IN SETTINGS.CFG)" : UseOwnFolder(fo, kind, dir, games);
+#endif
+            return;
+        }
+        // FOLDERS: TIDY or AS BEFORE (folders.h), the files moved at once, carefully.
+        if (key && !strcmp(key, "!folders"))
+        {
+            page.items[page.selected].values[0].second = SwitchFolders(fo, games);
+            return;
+        }
 #if SDL_VERSION_ATLEAST(2, 0, 14)
         if (key && !strcmp(key, "!releases"))
         {
@@ -1427,7 +1573,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
     std::function<void()> savesRequestFn; // (savesRequest, below: what Manage Saves leaves to do)
     auto launchSelected = [&]() {
         if (games.empty() || selected < 0 || selected >= (int)games.size()) return;
-#ifdef _WIN32
+#ifdef SSR_N3DS_PC
         // Omega Ruby and Alpha Sapphire: their code is made once from the dump (n3ds.h), the list
         // staying open and saying how it goes; then they play.
         if (games[selected].platform == Launcher::N3DS && !games[selected].comingSoon)
@@ -1458,6 +1604,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 note = "ADDING " + name + " TO FULLDEX (ONE TIME, ABOUT 2 GB): IT STARTS WHEN READY";
                 return;
             }
+            N3ds::SyncSave(g, fo.saves + "/" + g.saveName, true); // (a save brought in since the list was made)
             JavaStringArg("threeDsPlay", N3ds::IdOf(g));
             note = "STARTING " + name;
             return;
@@ -1466,8 +1613,8 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         if (Playable(fo, games[selected]))
         {
             // (A ROM not yet checked is, now: a hack plays with a save of its own.)
-            Launcher::ConfirmHack(games, (size_t)selected, fo.saves,
-                                  [](const Launcher::Game& g, const std::string& name) { return g.folder + "/" + name; });
+            Launcher::ConfirmHack(games, (size_t)selected, fo.settings,
+                                  [&fo](const Launcher::Game&, const std::string& name) { return fo.saves + "/" + name; });
             if (Launcher::SavesPlayCheck(games[selected], fo.saves + "/" + games[selected].saveName)) return; // (a save with a problem: says so first)
             note = PrepareLaunch(games[selected]);
             if (!note.empty()) { fprintf(stderr, "[launcher] launch blocked: %s: %s\n", games[selected].rom.c_str(), note.c_str()); return; }
@@ -1490,7 +1637,14 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         }
         if (guide)
         {
-            change(1);
+            // (A opens a link/page. Toggles and pickers have no select step: their shown value is
+            // the selection, changed with Left/Right.)
+            if (!page.items.empty())
+            {
+                const int sel = std::max(0, std::min(page.selected, (int)page.items.size() - 1));
+                const Launcher::Setting& s = page.items[sel];
+                (void)s; change(1); // (A still turns a toggle over and steps a picker on, as players are used to)
+            }
             return;
         }
         // The glass launcher: A on a section of the sidebar, or on the banner's buttons.
@@ -1504,7 +1658,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 F.kbFor = F.tool == 1 ? 1 : 2;
                 F.kbRom.clear();
                 F.text = F.tool == 2 ? Launcher::SearchText() : std::string();
-                F.dialog = 3; F.drow = 0; SDL_StartTextInput();
+                F.dialog = 3; F.drow = 0; StartListKeyboard();
                 return;
             }
             if (onTabs && !F.onSort) { Launcher::OpenTabMenu(tab); return; } // (a tab: move, hide; one of your own also rename, delete)
@@ -1531,6 +1685,13 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
 #elif defined(_WIN32)
                         const std::string dir = PickFolder(window, L"Choose the folder containing your ROMs");
                         if (!dir.empty()) useRomFolder(dir);
+#elif defined(__linux__)
+                        const auto picked = LinuxFolderPicker::Choose(fo.roms, "Choose the folder containing your ROMs");
+                        if (picked.available)
+                        {
+                            if (!picked.path.empty()) useRomFolder(picked.path);
+                        }
+                        else { folderBrowse = fo.roms; folderFirst = 0; showRomFolder(); }
 #else
                         folderBrowse = fo.roms; folderFirst = 0; showRomFolder();
 #endif
@@ -1541,9 +1702,9 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                     const bool was = roms[F.prow].hidden;
                     if (F.pact == (Launcher::CanChooseRomFolder() ? 1 : 0))
                     {
-                        const bool ok = Launcher::SetPair(fo.saves + "/fulldex-hidden.txt", rom, was ? "" : "1");
+                        const bool ok = Launcher::SetPair(fo.settings + "/fulldex-hidden.txt", rom, was ? "" : "1");
                         games = FindGames(fo, artCache);
-                        Launcher::BuildRomList(games, fo.saves);
+                        Launcher::BuildRomList(games, fo.settings);
                         reorderLibrary();
                         note = !ok ? "COULD NOT SAVE THE LIST" : was ? "BACK IN THE LIST" : "HIDDEN FROM THE LIST";
                     }
@@ -1559,7 +1720,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 {
                     // (Your Picture just chosen: the system's picker for it.)
                     const int ld = Launcher::LookDo(F.prow, 1);
-                    if (ld == 2) SDL_StartTextInput(); // (My Themes: the theme's name)
+                    if (ld == 2) StartListKeyboard(); // (My Themes: the theme's name)
 #ifdef _WIN32
                     if (ld == 4) { const std::string zip = PickZipFile(window); if (!zip.empty()) Launcher::ThemeImport(zip); }
 #endif
@@ -1584,7 +1745,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                     }
                     const std::string said = Launcher::HubDo(F.prow, F.pact);
                     if (!said.empty()) note = said;
-                    if (F.dialog == 3) SDL_StartTextInput(); // (the Trade page's code)
+                    if (F.dialog == 3) StartListKeyboard(); // (the Trade page's code)
                     return;
                 }
                 if (F.page == Launcher::SIDE_ABOUT && F.prow == 0) { Launcher::OpenSupportAsk(); return; } // (Buy Me A Coffee or PayPal)
@@ -1601,9 +1762,16 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             }
             if (F.banner == 2)
             {
-                // (Game Options: the menu of the game the banner offers.)
-                const int cg = Launcher::ContinueGame(games, selected);
-                if (cg >= 0) { selected = cg; F.banner = 0; F.popup = 0; follow = true; }
+                // (Game Options: the selected game's menu, keeping the Game Options focus. The
+                // pointer, the grid selection, and the keyboard/gamepad all land here.)
+                // (nothing chosen in the list, as on an empty Home: the game the banner shows, else the first one)
+                if (selected < 0 || selected >= (int)games.size()) { const int cg = Launcher::ContinueGame(games, selected); selected = cg >= 0 ? cg : Launcher::FirstIn(view()); }
+                if (selected >= 0 && selected < (int)games.size())
+                {
+                    F.banner = 2;
+                    F.popup = 0;
+                    follow = true;
+                }
                 return;
             }
             bool direct = false; // (Continue, or Play in the game's menu: played at once)
@@ -1620,7 +1788,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 F.popup = -1;
                 if (item == 1) { toggleFavourite(); return; }
                 const bool valid = selected >= 0 && selected < (int)games.size();
-                if (item == 2 && valid) { F.kbFor = 0; F.dialog = 3; F.drow = 0; F.text = Launcher::ShortName(games[selected]); SDL_StartTextInput(); return; }
+                if (item == 2 && valid) { F.kbFor = 0; F.dialog = 3; F.drow = 0; F.text = Launcher::ShortName(games[selected]); StartListKeyboard(); return; }
                 if (item == 5 && valid) { Launcher::OpenAddToTab(games[selected].rom); return; }
                 if (item == 6 && valid) { F.dialog = 1; F.drow = 0; return; }
 #ifdef __ANDROID__
@@ -1636,15 +1804,54 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                     return;
                 }
 #endif
+#ifdef __ANDROID__
+                // ADD TO PHONE HOME SCREEN: a shortcut that starts this game (GameActivity.pinShortcut),
+                // with the list's picture of it as the icon.
+                if (item == 7 && valid)
+                {
+                    const Launcher::Game& g = games[selected];
+                    const std::string icon = fo.dir + "/shortcut-icon.argb";
+                    if (FILE* f = fopen(icon.c_str(), "wb"))
+                    {
+                        const int32_t side = g.art.size() == (size_t)Launcher::Art * Launcher::Art ? Launcher::Art : 0;
+                        fwrite(&side, 4, 1, f); fwrite(&side, 4, 1, f);
+                        if (side) fwrite(g.art.data(), 4, g.art.size(), f);
+                        fclose(f);
+                    }
+                    bool ok = false;
+                    CallActivity("pinShortcut", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z", [&](JNIEnv* env, jclass c, jmethodID m) {
+                        jstring a = env->NewStringUTF(g.code.c_str()), b = env->NewStringUTF(Launcher::ShortName(g).c_str()), p = env->NewStringUTF(icon.c_str());
+                        ok = env->CallStaticBooleanMethod(c, m, a, b, p);
+                        env->DeleteLocalRef(a); env->DeleteLocalRef(b); env->DeleteLocalRef(p);
+                    });
+                    note = ok ? "CONFIRM ON YOUR PHONE TO ADD THE SHORTCUT" : "THIS PHONE'S HOME SCREEN DOES NOT TAKE SHORTCUTS";
+                    return;
+                }
+#endif
+#if !defined(SSR_PHONE) && !defined(__SWITCH__)
+                // The platform-launcher entry: Add To Steam, or Add To Desktop when Steam is
+                // not found (Android's phone home shortcut is above).
+                if (item == 7 && valid)
+                {
+                    note = SteamShortcuts::PlatformEntryDo(fo.dir, games[selected]);
+                    noteKeep = true;
+                    return;
+                }
+#endif
                 if (item == 3 && valid) { F.dialog = 4; F.drow = 0; return; }
                 if (item == 4 && valid && games[selected].platform == Launcher::N3DS)
                 {
-                    note = "3DS SAVES ARE KEPT IN THE GAME'S OWN FOLDER";
+                    // (Its save as the game last left it, then the page.)
+                    N3ds::SyncSave(games[selected], fo.saves + "/" + games[selected].saveName);
+                    Launcher::OpenSaves(games[selected], fo.saves + "/" + games[selected].saveName);
                     return;
                 }
                 if (item == 4 && valid)
                 {
-                    // Manage Saves: the game's saves on a page of their own (saves_page.h).
+                    // Manage Saves: the game's saves on a page of their own (saves_page.h). A DS ROM not yet
+                    // checked is, first, so that a hack shows its own save, not its game's.
+                    Launcher::ConfirmHack(games, (size_t)selected, fo.settings,
+                                          [&fo](const Launcher::Game&, const std::string& name) { return fo.saves + "/" + name; });
                     Launcher::OpenSaves(games[selected], fo.saves + "/" + games[selected].saveName);
                     return;
                 }
@@ -1835,7 +2042,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
     auto dialogClose = [&]() { Launcher::Focus().dialog = 0; kb.open = false; SDL_StopTextInput(); };
     auto importPicture = [&](const std::string& rom, const std::string& path) {
         std::string error;
-        const bool ok = Launcher::ImportArt(rom, fo.saves, path, error);
+        const bool ok = Launcher::ImportArt(rom, fo.settings, path, error);
         fprintf(stderr, "[launcher] picture for %s: %s (%s)\n", rom.c_str(), path.c_str(), ok ? "kept" : error.c_str());
         if (ok) { dialogClose(); reorderLibrary(); note = "PICTURE CHANGED"; }
         else { note = error; Launcher::Focus().dMsg = error; }
@@ -1908,7 +2115,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             if (F.drow == 0)
             {
                 dialogClose();
-                const bool ok = Launcher::SetPair(fo.saves + "/fulldex-hidden.txt", rom, "1");
+                const bool ok = Launcher::SetPair(fo.settings + "/fulldex-hidden.txt", rom, "1");
                 fprintf(stderr, "[launcher] taken off the list: %s (%s)\n", rom.c_str(), ok ? "saved" : "not saved");
                 reorderLibrary();
                 settle();
@@ -1995,7 +2202,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             {
                 // (Add To Tab, or a tab of your own's menu.)
                 const int r = Launcher::TabDialogPick(pick, tab, note);
-                if (r == 2) { kb.open = false; SDL_StartTextInput(); }
+                if (r == 2) { kb.open = false; StartListKeyboard(); }
                 if (r != 1) { scroll = 0; settle(); }
                 return;
             }
@@ -2030,7 +2237,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         }
         if (F.dialog == 4)
         {
-            const std::string artList = fo.saves + "/fulldex-art.txt";
+            const std::string artList = fo.settings + "/fulldex-art.txt";
             if (F.drow == 0)
             {
 #ifdef _WIN32
@@ -2087,7 +2294,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             Launcher::Game own = games[selected];
             own.customName.clear();
             if (name == Launcher::ShortName(own)) name.clear();
-            const bool ok = Launcher::SetPair(fo.saves + "/fulldex-names.txt", rom, name);
+            const bool ok = Launcher::SetPair(fo.settings + "/fulldex-names.txt", rom, name);
             reorderLibrary();
             note = !ok ? "COULD NOT SAVE THE NAME" : name.empty() ? "NAME RESET" : "RENAMED";
         }
@@ -2253,7 +2460,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
                 {
                     int ww = 1, wh = 1;
-                    SDL_GetWindowSize(window, &ww, &wh);
+                    ListWindowSize(window, &ww, &wh);
                     const int row = raMenu.ItemAt(e.button.x * canvas.w / std::max(1, ww), e.button.y * canvas.h / std::max(1, wh));
                     if (row >= 0)
                     {
@@ -2325,7 +2532,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                     else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
                     {
                         int ww = 1, wh = 1;
-                        SDL_GetWindowSize(window, &ww, &wh);
+                        ListWindowSize(window, &ww, &wh);
                         const int hit = kb.ItemAt(e.button.x * canvas.w / std::max(1, ww), e.button.y * canvas.h / std::max(1, wh));
                         if (hit >= 0) { kb.selected = hit; press(hit); }
                     }
@@ -2370,7 +2577,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
                 {
                     int ww = 1, wh = 1;
-                    SDL_GetWindowSize(window, &ww, &wh);
+                    ListWindowSize(window, &ww, &wh);
                     const int row = Launcher::DialogAt(e.button.x * canvas.w / std::max(1, ww), e.button.y * canvas.h / std::max(1, wh));
                     if (row >= 0) { F.drow = row; dialogAct(); }
                 }
@@ -2412,7 +2619,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 else if (e.type == SDL_MOUSEBUTTONUP && e.button.button == SDL_BUTTON_LEFT)
                 {
                     int ww = 1, wh = 1;
-                    SDL_GetWindowSize(window, &ww, &wh);
+                    ListWindowSize(window, &ww, &wh);
                     const int row = updateMenu.ItemAt(e.button.x * canvas.w / std::max(1, ww), e.button.y * canvas.h / std::max(1, wh));
                     if (row >= 0) { updateMenu.selected = row; pick(row); }
                     else if (row == -2) updateMenu.open = false;
@@ -2449,7 +2656,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 {
                     // (A click or tap on a row: chosen and used.)
                     int ww = 1, wh = 1;
-                    SDL_GetWindowSize(window, &ww, &wh);
+                    ListWindowSize(window, &ww, &wh);
                     const int row = keysMenu.ItemAt(e.button.x * canvas.w / std::max(1, ww), e.button.y * canvas.h / std::max(1, wh));
                     if (row >= 0) { keysMenu.selected = row; keysActivate(row); }
                     else if (row == -2) keysOpen = false;
@@ -2607,7 +2814,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             {
                 // (Window points to the canvas's pixels, which are more on a high-DPI screen.)
                 int ww = 1, wh = 1;
-                SDL_GetWindowSize(window, &ww, &wh);
+                ListWindowSize(window, &ww, &wh);
                 const int mx = (e.type == SDL_MOUSEMOTION ? e.motion.x : e.button.x) * canvas.w / std::max(1, ww);
                 const int my = (e.type == SDL_MOUSEMOTION ? e.motion.y : e.button.y) * canvas.h / std::max(1, wh);
                 const int s = std::max(1, std::min(canvas.w, canvas.h) / 240);
@@ -2810,9 +3017,16 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                     if (e.type == SDL_MOUSEBUTTONUP)
                     {
                         pressed = false;
-                        // (A section of the sidebar: the settings close and it opens, no Back first.)
+                        // (A section of the sidebar: the settings close and it opens, no Back first.
+                        // Settings itself takes a step back: a group to the groups, the groups out.)
                         const int sd = Launcher::SideAt(canvas, mx, my);
-                        if (sd >= 0 && sd != Launcher::SIDE_SETTINGS)
+                        if (sd == Launcher::SIDE_SETTINGS)
+                        {
+                            onBack = false;
+                            if (!page.Back()) toggleGuide();
+                            break;
+                        }
+                        if (sd >= 0)
                         {
                             guide = false; onBack = false; Launcher::Focus().side = -1;
                             if (!Launcher::OpenSide(sd)) note = std::string(Launcher::SideName(sd)) + ": COMING SOON";
@@ -2824,7 +3038,17 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                             for (const auto& r : setMenu.pickRects)
                                 if (mx >= r[0] && mx < r[0] + r[2] && my >= r[1] && my < r[1] + r[3])
                                 {
-                                    for (size_t k = 0; k < page.items[page.selected].values.size() && page.ValueIndex(page.items[page.selected]) != r[4]; k++) change(1);
+                                    // (The card's choice is in the drawn order; map it to the
+                                    // stored value by its shown label before stepping to it.)
+                                    int target = r[4];
+                                    const Launcher::Setting& s = page.items[page.selected];
+                                    if (setMenu.selected >= 0 && setMenu.selected < (int)setMenu.items.size() &&
+                                        target < (int)setMenu.items[setMenu.selected].choices.size())
+                                    {
+                                        const std::string& shown = setMenu.items[setMenu.selected].choices[target];
+                                        for (int i = 0; i < (int)s.values.size(); i++) if (s.values[i].second == shown) { target = i; break; }
+                                    }
+                                    for (size_t k = 0; k < s.values.size() && page.ValueIndex(s) != target; k++) change(1);
                                     cardHit = true;
                                     break;
                                 }
@@ -2833,7 +3057,61 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                         {
                             const int item = setMap[hit];
                             if (item < 0) { onBack = false; if (!page.Back()) guide = false; }
-                            else if (page.items[item].key) { if (item == page.selected && !onBack) change(1); else { page.selected = item; onBack = false; } }
+                            else
+                            {
+                                page.selected = item; onBack = false;
+                                // (Touch/mouse: the visible control is the hit target; the row's
+                                // name only selects. The pad changes values with Left/Right.)
+                                const UiInput::Part* part = nullptr;
+                                for (const auto& p : setMenu.parts)
+                                    if (p.item == hit && UiInput::InPart(p, mx, my)) { part = &p; break; }
+                                if (part && part->intent == UiInput::Intent::Set)
+                                {
+                                    const Launcher::Setting& s = page.items[item];
+                                    const int cur = page.ValueIndex(s), n = (int)s.values.size();
+                                    // (The pill's index is the drawn OFF/ON order; the stored values
+                                    // may be in another order, so map by the shown label.)
+                                    int target = part->value;
+                                    if (hit < (int)setMenu.items.size() && target < (int)setMenu.items[hit].choices.size())
+                                    {
+                                        const std::string& shown = setMenu.items[hit].choices[target];
+                                        for (int i = 0; i < n; i++) if (s.values[i].second == shown) { target = i; break; }
+                                    }
+                                    if (n > 0 && target != cur)
+                                    {
+                                        const int fwd = (target - cur + n) % n, back = (cur - target + n) % n;
+                                        const int steps = fwd <= back ? fwd : back;
+                                        for (int k = 0; k < steps; k++) change(fwd <= back ? 1 : -1);
+                                    }
+                                }
+                                else if (part && part->intent == UiInput::Intent::Step)
+                                    change(part->value < 0 ? -1 : 1);
+                                else if (part && part->intent == UiInput::Intent::Open)
+                                    change(1);
+                                else if (!part)
+                                {
+                                    const Launcher::Setting& s = page.items[item];
+                                    bool onOff = s.values.size() == 2;
+                                    for (const auto& v : s.values) onOff = onOff && (v.second == "ON" || v.second == "OFF");
+                                    if (onOff)
+                                    {
+                                        // (The drawn pills: left = OFF, right = ON. Map the label
+                                        // to the stored order, then step to it.)
+                                        const bool right = mx >= setMenu.ctlX + setMenu.ctlW / 2;
+                                        const char* shown = right ? "ON" : "OFF";
+                                        int target = 0;
+                                        for (int i = 0; i < (int)s.values.size(); i++) if (s.values[i].second == shown) { target = i; break; }
+                                        const int cur = page.ValueIndex(s), n = (int)s.values.size();
+                                        if (n > 0 && target != cur)
+                                        {
+                                            const int fwd = (target - cur + n) % n, back = (cur - target + n) % n;
+                                            for (int k = 0; k < (fwd <= back ? fwd : back); k++) change(fwd <= back ? 1 : -1);
+                                        }
+                                    }
+                                    else if (s.key && (!strncmp(s.key, "!group", 6) || s.key[0] == '!')) change(1);
+                                }
+                                // (Focus: the row's name; it only selects.)
+                            }
                         }
                     }
                     break;
@@ -2949,7 +3227,8 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 {
                     selected = i;
                     onSettings = onTabs = false; Launcher::Focus() = Launcher::GlassFocus{};
-                    note.clear();
+                    if (!noteKeep) note.clear();
+                    noteKeep = false;
                     // Pointer selection leaves the list under the finger; controller movement
                     // follows its chosen card. A partial card must not jump at touch-down.
                     if (e.type == SDL_MOUSEBUTTONDOWN) follow = false;
@@ -2961,6 +3240,14 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 break;
             }
             case SDL_MOUSEWHEEL:
+                // (The settings page scrolls under the wheel, as a finger's drag does.)
+                if (Launcher::Glassy(canvas) && guide && setMenu.open)
+                {
+                    int steps = e.wheel.y;
+                    if (e.wheel.direction == SDL_MOUSEWHEEL_FLIPPED) steps = -steps;
+                    if (steps) { setMenu.freeScroll = true; setMenu.scrollPx = std::max(0, setMenu.scrollPx - steps * std::max(30, setMenu.rowH * 2)); }
+                    break;
+                }
                 if (Launcher::Glassy(canvas) && !guide && Launcher::NotesScroll(e.wheel.y > 0 ? -2 : 2)) break; // (What's New)
                 if (!guide && !setMenu.open && Launcher::Focus().page < 0 && Launcher::Focus().dialog == 0 && Launcher::Focus().popup < 0 && !Launcher::TilesOn())
                 {
@@ -3058,6 +3345,13 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         }
 
 #ifdef __ANDROID__
+        // FOLDERS: back from the picker with a folder for saves, states, cheats or settings.
+        if (!PendingPick().empty() && !JavaBool("picking"))
+        {
+            const std::string kind = PendingPick();
+            PendingPick().clear();
+            note = UseOwnFolder(fo, kind, JavaStringStringArg("takePicked", kind), games);
+        }
         // Back from Android's folder picker (or its "All files access" page): the folder it
         // gave, and the games in it at once.
         const bool pickingNow = JavaBool("picking");
@@ -3065,6 +3359,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         {
             lastFolderCheck = SDL_GetTicks();
             SetRomFolder(fo);
+            ResolveFolders(fo, false);
             needFolder = (fo.roms.empty() || !JavaBool("canUseFiles")) && !getenv("SSR_ANDROID_ROMS");
             if (!needFolder)
             {
@@ -3091,7 +3386,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             lastScan = SDL_GetTicks();
             const std::string current = selected < 0 || selected >= (int)games.size() ? std::string() : games[selected].rom;
             games = FindGames(fo, artCache);
-            Launcher::BuildRomList(games, fo.saves);
+            Launcher::BuildRomList(games, fo.settings);
             reorderLibrary();
             selected = -1;
             for (size_t i = 0; i < games.size(); i++)
@@ -3102,6 +3397,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         if (appBackgrounded) { gridMotion.Stop(); SDL_Delay(50); continue; }
         int ow = 1280, oh = 720;
 #ifdef SSR_IOS
+        SDL_Rect safeDst = { 0, 0, 0, 0 };
         if (SDL_GetRendererOutputSize(renderer, &ow, &oh) != 0 || ow <= 0 || oh <= 0)
         {
             if (!loggedDrawableError) fprintf(stderr, "[launcher] waiting for drawable: %dx%d %s\n", ow, oh, SDL_GetError());
@@ -3119,8 +3415,35 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             loggedDrawableW = ow; loggedDrawableH = oh;
             loggedPresent = false;
         }
+        {
+            // (The safe area, in the drawable's pixels.)
+            static bool filterOn = false;
+            if (!filterOn) { SDL_SetEventFilter(SafeAreaFilter, nullptr); IosIgnoreControllerPresses(); filterOn = true; }
+            int pointsW = 1, pointsH = 1;
+            SDL_GetWindowSize(window, &pointsW, &pointsH);
+            {
+                // iPadOS gives and takes back room at the top (the status bar, the window's
+                // controls) while the list is up: following it moved the whole list 32 points
+                // under the player's finger, so a tap could land on what was there a moment
+                // before. The insets only grow until the window's size changes (a turn).
+                static int keepW = 0, keepH = 0;
+                int t = 0, b = 0, l = 0, r = 0;
+                IosSafeInsets(&t, &b, &l, &r);
+                if (pointsW != keepW || pointsH != keepH) { keepW = pointsW; keepH = pointsH; g_safeT = t; g_safeB = b; g_safeL = l; g_safeR = r; }
+                else { g_safeT = std::max(g_safeT, t); g_safeB = std::max(g_safeB, b); g_safeL = std::max(g_safeL, l); g_safeR = std::max(g_safeR, r); }
+            }
+            const double px = (double)ow / std::max(1, pointsW);
+            safeDst = { (int)(g_safeL * px), (int)(g_safeT * px), 0, 0 };
+            ow = std::max(1, ow - (int)((g_safeL + g_safeR) * px));
+            oh = std::max(1, oh - (int)((g_safeT + g_safeB) * px));
+            safeDst.w = ow; safeDst.h = oh;
+        }
 #else
-        SDL_GetRendererOutputSize(renderer, &ow, &oh);
+        if (SDL_GetRendererOutputSize(renderer, &ow, &oh) != 0 || ow <= 0 || oh <= 0)
+        {
+            SDL_Delay(16);
+            continue; // Keep pumping lifecycle events while the drawable is recreated.
+        }
 #endif
 #ifdef SSR_PHONE
         // Bound software composition work on high density phone displays. (Drawn at 1280 on the long side and
@@ -3182,12 +3505,18 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             for (Launcher::Setting& it : page.items)
             {
                 if (it.key && !strcmp(it.key, "!ra_login") && !it.values.empty()) it.values[0].second = raAccountShown();
+                if (it.key && !strcmp(it.key, "!folders") && !it.values.empty() && it.values[0].second == "TIDY") it.values[0].second = FoldersShown(fo);
+                if (it.key && (!strcmp(it.key, "!states_folder") || !strcmp(it.key, "!cheats_folder") || !strcmp(it.key, "!settings_folder")) && !it.values.empty() && it.values[0].second == "FULLDEX'S") it.values[0].second = OwnFolderShown(fo, it.key);
+#ifdef __ANDROID__
+                if (it.key && !strcmp(it.key, "!saves_folder") && !it.values.empty() && it.values[0].second == "FULLDEX'S") it.values[0].second = OwnFolderShown(fo, it.key);
+                if (it.key && PendingPick().empty() && !it.values.empty() && it.values[0].second == "CHOOSE THE FOLDER...") it.values[0].second = OwnFolderShown(fo, it.key);
+#endif
                 if (it.key && !strcmp(it.key, "!saves_folder") && !it.values.empty() && it.values[0].second == "BESIDE THE ROMS") { const std::string sf = Launcher::ConfigValue(fo.cfg, "saves_folder"); if (!sf.empty()) it.values[0].second = sf; }
             }
             if (Launcher::Glassy(canvas))
             {
                 // (The pause menu's glass settings pages, ui_settings.h, over the chosen game's picture blurred.)
-                setMenu.touchRows = Launcher::PhoneUi() ? 1.5f : 1.0f; // (a phone: rows big enough for a finger, the page larger)
+                setMenu.touchRows = Launcher::PhoneUi() && !Launcher::LargeUi() ? 1.5f : 1.0f; // (a phone: rows big enough for a finger, the page larger)
                 setMenu.laneK = Launcher::PhoneUi() ? std::max(0.42f, Launcher::GU(canvas) * (480.0f / 720.0f) * 0.94f * 1.3f) : 0.0f; // (by the launcher's own unit: right upright too)
                 { static int lastSel = -99; if (page.selected != lastSel) { lastSel = page.selected; setMenu.freeScroll = false; } }
                 Launcher::BuildSettingsMenu(setMenu, setMap, page, onBack);
@@ -3255,7 +3584,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 if (np.artVersion != artSeen) { artSeen = np.artVersion; MB.art = np.art; MB.artW = np.artW; MB.artH = np.artH; }
                 if (MB.action >= 0) { if (!fake) NowPlaying::Command(MB.action); MB.action = -1; }
             }
-#ifdef _WIN32
+#ifdef SSR_N3DS_PC
             if (N3ds::Busy())
             {
                 const std::string prep = N3ds::Status(); if (!prep.empty()) note = prep;
@@ -3277,6 +3606,10 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                     // (Built, or code from a PC taken: the tile and menu say so.)
                     for (Launcher::Game& g : games)
                         if (g.platform == Launcher::N3DS && !busy3ds) g.built = JavaBoolStringArg("threeDsBuilt", N3ds::IdOf(g));
+                    // (Back from a game: its save copied to the saves folder.)
+                    if (!busy3ds)
+                        for (const Launcher::Game& g : games)
+                            if (g.platform == Launcher::N3DS) N3ds::SyncSave(g, fo.saves + "/" + g.saveName);
                     // (The first Play's copy done: the game starts.)
                     std::string& autoPlay = N3dsAutoPlay();
                     if (!autoPlay.empty() && !busy3ds)
@@ -3288,7 +3621,10 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
                 }
             }
 #endif
-            Launcher::Draw(canvas, games, tab, !Launcher::TilesOn() && (onSettings || onTabs || Launcher::Focus().side >= 0 || Launcher::Focus().banner) ? -1 : selected, scroll, note, (Launcher::Focus().popup >= 0 || Launcher::Focus().dialog || Launcher::Focus().page >= 0) ? (padIn ? btn(Controls::A) + ": CHOOSE    " + btn(Controls::B) + ": BACK" : std::string("ENTER: CHOOSE    ESC: BACK")) : hint, theme, follow, onTabs, onSettings);
+            const bool bannerOnly = !Launcher::TilesOn() && (onSettings || onTabs || Launcher::Focus().side >= 0 || Launcher::Focus().banner);
+            const int gridSelected = bannerOnly ? -1 : selected;
+            const int menuGame = Launcher::Focus().popup >= 0 ? selected : -1;
+            Launcher::Draw(canvas, games, tab, gridSelected, scroll, note, (Launcher::Focus().popup >= 0 || Launcher::Focus().dialog || Launcher::Focus().page >= 0) ? (padIn ? btn(Controls::A) + ": CHOOSE    " + btn(Controls::B) + ": BACK" : std::string("ENTER: CHOOSE    ESC: BACK")) : hint, theme, follow, onTabs, onSettings, menuGame);
         }
 #ifdef SSR_UPDATER
         if (updateMenu.open)
@@ -3364,7 +3700,13 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
         }
         SDL_SetRenderDrawColor(renderer, 16, 16, 16, 255);
         if (!texture || SDL_UpdateTexture(texture, nullptr, canvas.px.data(), canvas.w * 4) != 0 ||
-            SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, nullptr, nullptr) != 0)
+            SDL_RenderClear(renderer) != 0 || SDL_RenderCopy(renderer, texture, nullptr,
+#ifdef SSR_IOS
+                                                    safeDst.w > 0 ? &safeDst : nullptr
+#else
+                                                    nullptr
+#endif
+                                                    ) != 0)
         {
             fprintf(stderr, "[launcher] drawing failed: %s\n", SDL_GetError());
             if (renderInfo.flags & SDL_RENDERER_SOFTWARE)
@@ -3425,10 +3767,10 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             loggedPresent = true;
         }
 #endif
-        // (SSR_LIST_KEYS=lrud...: those arrow presses, once, before the first picture, for the navigation tests.)
+        // (SSR_LIST_KEYS=lrud...: those arrow presses (a: A), once, before the first picture, for the navigation tests.)
         static int keysAge = -1;
         if (keysAge >= 0) keysAge++;
-        if (const char* tk = getenv("SSR_LIST_KEYS")) { static bool keysDone = false; if (!keysDone) { keysDone = true; keysAge = 0; for (const char* q = tk; *q; q++) move(*q == 'l' ? 1 : *q == 'r' ? 2 : *q == 'u' ? 3 : 4); } }
+        if (const char* tk = getenv("SSR_LIST_KEYS")) { static bool keysDone = false; if (!keysDone) { keysDone = true; keysAge = 0; for (const char* q = tk; *q; q++) { if (*q == 'a') choose(); else move(*q == 'l' ? 1 : *q == 'r' ? 2 : *q == 'u' ? 3 : 4); } } }
         // (SSR_LIST_CHOOSE=a game code: that game chosen once as a player would, its menu's Play: a 3DS
         // game not prepared yet starts preparing, and SSR_LIST_SHOT waits until that has ended.)
         if (const char* tc = getenv("SSR_LIST_CHOOSE"))
@@ -3472,7 +3814,7 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
             if (ls.state == HubLink::State::Linked && ls.mine.any && ls.theirs.any && ls.theyCanTake && !ls.iAccepted && !autoAccepted) { HubLink::Accept(true); autoAccepted = true; }
         }
         const char* shotWait = getenv("SSR_LIST_SHOT_WAIT");
-#ifdef _WIN32
+#ifdef SSR_N3DS_PC
         const bool preparing = N3ds::P().running;
 #else
         const bool preparing = false;
@@ -3505,6 +3847,271 @@ int PickGame(Folders& fo, std::vector<Launcher::Game>& games, int selected, bool
 }
 }
 
+namespace
+{
+// A saves folder the player chose (SAVES FOLDER), as against the one FullDex writes down itself when a
+// phone's ROM folder is chosen (the folder beside the ROMs, or the tidy one): only the first is theirs.
+bool OwnSavesFolder(const Folders& fo)
+{
+    namespace fs = std::filesystem;
+    const std::string sf = Launcher::ConfigValue(fo.cfg, "saves_folder");
+    if (sf.empty()) return false;
+#ifdef __ANDROID__
+    const std::string base = fo.roms.empty() ? fo.dir : fo.roms;
+    const std::string classic = base + "/saves", tidy = (fo.roms.empty() ? fo.dir : fo.roms + "/FullDex") + "/saves";
+#else
+    const std::string classic = fo.dir + "/saves", tidy = classic;
+#endif
+    const fs::path p = fs::u8path(sf).lexically_normal();
+    return p != fs::u8path(classic).lexically_normal() && p != fs::u8path(tidy).lexically_normal();
+}
+
+// FOLDERS (folders.h): the saves, save states, cheats and settings folders. At the start, an update's
+// files are moved once into the tidy layout (unless the player chose a saves folder of their own: that
+// setup is left as it is); a move cut short last time is finished or taken back first. atStart false
+// (a phone's new ROM folder): the folders worked out again, nothing moved.
+void ResolveFolders(Folders& fo, bool atStart)
+{
+    namespace fs = std::filesystem;
+    const bool customSaves = OwnSavesFolder(fo);
+#ifdef __ANDROID__
+    const std::string root = fo.roms.empty() ? fo.dir : fo.roms + "/FullDex";
+#else
+    const std::string root = fo.dir;
+#endif
+    const std::string tidySaves = root + "/saves", journal = fo.dir + "/folders-move.txt";
+    const bool sameSaves = fs::u8path(fo.saves).lexically_normal() == fs::u8path(tidySaves).lexically_normal();
+    std::vector<std::string> keep = { fo.dir, root, tidySaves };
+    if (!fo.roms.empty()) keep.push_back(fo.roms);
+    if (sameSaves || customSaves) keep.push_back(fo.saves);
+    std::string layout = Launcher::ConfigValue(fo.cfg, "folders_layout");
+    if (atStart)
+    {
+        if (FolderSet::FinishCutShort(fo.dir + "/folders-move.txt", keep)) fprintf(stderr, "[folders] a move cut short was finished or taken back\n");
+        if (layout.empty())
+        {
+            if (customSaves) layout = "classic";
+            else
+            {
+                // (What there is in the folders as they were: the saves folder's files, by kind, and on a
+                // phone the cheats folder beside it.)
+                FolderSet::Pairs pairs;
+                std::error_code e;
+                if (FolderSet::IsDir(fo.saves))
+                    for (fs::directory_iterator it(fs::u8path(fo.saves), e), end; !e && it != end; it.increment(e))
+                    {
+                        const std::string name = it->path().filename().u8string(), path = it->path().u8string();
+                        const bool dir = it->is_directory(e);
+                        if (FolderSet::IsSettingsName(name, dir)) FolderSet::AddTree(path, root + "/settings/" + name, pairs);
+                        else if (!dir && FolderSet::IsStateName(name)) FolderSet::AddTree(path, root + "/states/" + name, pairs);
+                        else if (!sameSaves) FolderSet::AddTree(path, tidySaves + "/" + name, pairs);
+                    }
+                const fs::path sp = fs::u8path(fo.saves);
+                if (sp.filename() == "saves")
+                {
+                    const std::string oldCheats = sp.parent_path().u8string() + "/cheats", newCheats = root + "/cheats";
+                    if (fs::u8path(oldCheats).lexically_normal() != fs::u8path(newCheats).lexically_normal() && FolderSet::IsDir(oldCheats))
+                        FolderSet::AddTree(oldCheats, newCheats, pairs);
+                }
+                if (pairs.empty()) layout = "tidy";
+                else
+                {
+                    std::string why;
+                    if (FolderSet::Move(pairs, journal, keep, why))
+                    {
+                        layout = "tidy";
+                        SetConfigValues(fo.cfg, { { "folders_moved", "1" } });
+                        if (!Launcher::ConfigValue(fo.cfg, "saves_folder").empty()) SetConfigValues(fo.cfg, { { "saves_folder", tidySaves } });
+                        fprintf(stderr, "[folders] %d files moved into the tidy folders under %s\n", (int)pairs.size(), root.c_str());
+                    }
+                    else fprintf(stderr, "[folders] not moved (%s): as before for now, tried again next time\n", why.c_str());
+                }
+            }
+            if (!layout.empty()) SetConfigValues(fo.cfg, { { "folders_layout", layout } });
+        }
+    }
+    if (layout == "tidy")
+    {
+        if (!customSaves)
+        {
+            fo.saves = tidySaves;
+            if (!Launcher::ConfigValue(fo.cfg, "saves_folder").empty() && Launcher::ConfigValue(fo.cfg, "saves_folder") != tidySaves) SetConfigValues(fo.cfg, { { "saves_folder", tidySaves } });
+        }
+        fo.states = root + "/states";
+        fo.settings = root + "/settings";
+        // (A saves folder left empty where the classic one was, beside the ROMs: taken away.)
+        if (!fo.roms.empty())
+        {
+            std::error_code e;
+            const fs::path old = fs::u8path(fo.roms + "/saves");
+            if (old.lexically_normal() != fs::u8path(fo.saves).lexically_normal() && fs::is_directory(old, e) && fs::is_empty(old, e)) fs::remove(old, e);
+        }
+    }
+    else { fo.states.clear(); fo.settings = fo.saves; }
+    fo.cheats.clear();
+    // (Folders of the player's own, when they are there.)
+    if (const std::string v = Launcher::ConfigValue(fo.cfg, "states_folder"); FolderSet::IsDir(v)) fo.states = v;
+    if (const std::string v = Launcher::ConfigValue(fo.cfg, "cheats_folder"); FolderSet::IsDir(v)) fo.cheats = v;
+    if (const std::string v = Launcher::ConfigValue(fo.cfg, "settings_folder"); FolderSet::IsDir(v)) fo.settings = v;
+    FolderSet::MakeDirs(fo.saves);
+    FolderSet::MakeDirs(fo.settings);
+    if (!fo.states.empty()) FolderSet::MakeDirs(fo.states);
+    FolderSet::States() = fo.states;
+    FolderSet::CheatsDir() = fo.cheats;
+    // (Cloud saves: the Hub syncs the save the game reads, in the saves folder, not the one beside
+    // the settings. Refreshed here so a change of saves folder is followed.)
+    Launcher::PlatformSavePath() = [saves = fo.saves](const Launcher::Game& g) { return saves + "/" + g.saveName; };
+    fprintf(stderr, "[folders] %s: saves %s, states %s, cheats %s, settings %s\n", layout.empty() ? "classic (for now)" : layout.c_str(),
+            fo.saves.c_str(), fo.states.empty() ? "(beside the saves)" : fo.states.c_str(),
+            fo.cheats.empty() ? "(beside the saves folder)" : fo.cheats.c_str(), fo.settings.c_str());
+}
+
+// FOLDERS (the option): what it says, and a choice of it: TIDY to AS BEFORE (UNDO) or back, every file
+// moved the careful way (folders.h Move). The list's tabs and names read again from where they now are.
+std::string FoldersShown(const Folders& fo)
+{
+    if (OwnSavesFolder(fo)) return "YOUR OWN SAVES FOLDER";
+    return Launcher::ConfigValue(fo.cfg, "folders_layout") == "tidy" ? "TIDY" : "AS BEFORE";
+}
+std::string SwitchFolders(Folders& fo, const std::vector<Launcher::Game>& games)
+{
+    namespace fs = std::filesystem;
+    if (OwnSavesFolder(fo)) return "YOUR OWN SAVES FOLDER: LEFT AS IT IS";
+    std::string result;
+    if (Launcher::ConfigValue(fo.cfg, "folders_layout") == "tidy")
+    {
+#ifdef __ANDROID__
+        const std::string root = fo.roms.empty() ? fo.dir : fo.roms + "/FullDex";
+        const std::string classic = (fo.roms.empty() ? fo.dir : fo.roms) + "/saves";
+#else
+        const std::string root = fo.dir, classic = fo.dir + "/saves";
+#endif
+        FolderSet::Pairs pairs;
+        FolderSet::AddTree(root + "/states", classic, pairs);
+        FolderSet::AddTree(root + "/settings", classic, pairs);
+        if (fs::u8path(root + "/saves").lexically_normal() != fs::u8path(classic).lexically_normal())
+        {
+            FolderSet::AddTree(root + "/saves", classic, pairs);
+            FolderSet::AddTree(root + "/cheats", fs::u8path(classic).parent_path().u8string() + "/cheats", pairs);
+        }
+        std::vector<std::string> keep = { fo.dir, classic };
+        if (!fo.roms.empty()) keep.push_back(fo.roms);
+        std::string why;
+        if (!pairs.empty() && !FolderSet::Move(pairs, fo.dir + "/folders-move.txt", keep, why)) return "NOT MOVED: " + why;
+        SetConfigValues(fo.cfg, { { "folders_layout", "classic" } });
+        if (!Launcher::ConfigValue(fo.cfg, "saves_folder").empty()) SetConfigValues(fo.cfg, { { "saves_folder", classic } });
+        fo.saves = classic;
+        ResolveFolders(fo, false);
+        result = "AS BEFORE: " + std::to_string(pairs.size()) + " FILES MOVED BACK";
+    }
+    else
+    {
+        SetConfigValues(fo.cfg, { { "folders_layout", "" } });
+        ResolveFolders(fo, true);
+        if (Launcher::ConfigValue(fo.cfg, "folders_layout") != "tidy") return "NOT MOVED: SEE GAME.LOG";
+        SetConfigValues(fo.cfg, { { "folders_moved", "shown" } });
+        result = "TIDY: FILES MOVED";
+    }
+    Launcher::LoadTabs(fo.settings);
+    Launcher::BuildRomList(games, fo.settings);
+    fprintf(stderr, "[folders] %s\n", result.c_str());
+    return result;
+}
+
+// FOLDERS of the player's own (SAVE STATES FOLDER, CHEATS FOLDER, SETTINGS FOLDER; SAVES FOLDER on a
+// phone): the kind waiting for a phone's folder picker; what the option says.
+std::string& PendingPick() { static std::string k; return k; }
+std::string OwnFolderShown(const Folders& fo, const char* key)
+{
+    const std::string kind(key + 1, strlen(key) - 8), v = Launcher::ConfigValue(fo.cfg, (kind + "_folder").c_str());
+    if (v.empty() || (kind == "saves" && !OwnSavesFolder(fo))) return "FULLDEX'S";
+    const size_t s = v.find_last_of("/\\");
+    return s == std::string::npos ? v : v.substr(s + 1);
+}
+// A folder for one kind: the files of that kind copied there (none replaced; the old ones stay where
+// they were), then used at once. dir: the folder ("" none chosen; "!" one that cannot be used).
+std::string UseOwnFolder(Folders& fo, const std::string& kind, const std::string& dir, const std::vector<Launcher::Game>& games)
+{
+    namespace fs = std::filesystem;
+    if (dir.empty() || dir == "-") return "NO FOLDER CHOSEN";
+    if (dir == "!" || !FolderSet::IsDir(dir)) return "THAT FOLDER CANNOT BE USED: CHOOSE ONE ON THIS DEVICE'S STORAGE";
+    int copied = 0;
+    if (kind == "saves")
+    {
+        std::string said;
+        copied = Launcher::CopySavesTo(fo.saves, dir, said);
+        if (copied < 0) return said;
+    }
+    else
+    {
+        // (Where that kind is now: its own folder, or among the saves in the classic layout.)
+        const fs::path sp = fs::u8path(fo.saves);
+        const std::string cheatsNow = !fo.cheats.empty() ? fo.cheats : sp.filename() == "saves" ? sp.parent_path().u8string() + "/cheats" : fo.saves + "/cheats";
+        const std::string from = kind == "states" ? (fo.states.empty() ? fo.saves : fo.states) : kind == "cheats" ? cheatsNow : fo.settings;
+        const bool amongSaves = (kind == "states" && fo.states.empty()) || (kind == "settings" && fo.settings == fo.saves);
+        FolderSet::Pairs pairs;
+        std::error_code e;
+        if (FolderSet::IsDir(from))
+            for (fs::directory_iterator it(fs::u8path(from), e), end; !e && it != end; it.increment(e))
+            {
+                const std::string name = it->path().filename().u8string();
+                const bool isDir = it->is_directory(e);
+                if (amongSaves && !(kind == "states" ? (!isDir && FolderSet::IsStateName(name)) : FolderSet::IsSettingsName(name, isDir))) continue;
+                FolderSet::AddTree(it->path().u8string(), dir + "/" + name, pairs);
+            }
+        for (const auto& p : pairs)
+        {
+            if (fs::exists(fs::u8path(p.second), e)) continue;
+            fs::create_directories(fs::u8path(p.second).parent_path(), e);
+            fs::copy_file(fs::u8path(p.first), fs::u8path(p.second), e);
+            if (!e) copied++;
+        }
+    }
+    SetConfigValues(fo.cfg, { { kind + "_folder", dir } });
+#ifndef __ANDROID__
+    if (kind == "saves") return std::to_string(copied) + " FILES COPIED: USED FROM THE NEXT START";
+#endif
+    ResolveFolders(fo, false);
+    Launcher::LoadTabs(fo.settings);
+    Launcher::BuildRomList(games, fo.settings);
+    fprintf(stderr, "[folders] %s folder %s (%d files copied)\n", kind.c_str(), dir.c_str(), copied);
+    return std::to_string(copied) + " FILES COPIED: IN USE NOW";
+}
+// A folder chosen in the system's own picker ("" none): Windows' own, zenity or kdialog on Linux,
+// AppleScript on a Mac. Not on a phone (its picker answers later: PendingPick).
+#if !defined(__ANDROID__) && !defined(SSR_IOS) && !defined(_WIN32)
+static std::string RunPicker(const std::string& command)
+{
+    std::string out;
+    if (FILE* p = popen(command.c_str(), "r"))
+    {
+        char buf[4096];
+        while (fgets(buf, sizeof buf, p)) out += buf;
+        pclose(p);
+    }
+    while (!out.empty() && (out.back() == '\n' || out.back() == '\r')) out.pop_back();
+    while (out.size() > 1 && out.back() == '/') out.pop_back();
+    return out;
+}
+#endif
+std::string PickAnyFolder(SDL_Window* window, const std::string& kind)
+{
+    (void)window;
+    const std::string what = kind == "states" ? "save states" : kind;
+#if defined(_WIN32)
+    std::wstring t = L"Choose the folder for your ";
+    for (char ch : what) t += (wchar_t)ch;
+    return PickFolder(window, t.c_str());
+#elif defined(__APPLE__) && !defined(SSR_IOS)
+    return RunPicker("osascript -e 'POSIX path of (choose folder with prompt \"Choose the folder for your " + what + "\")' 2>/dev/null");
+#elif defined(__linux__) && !defined(__ANDROID__)
+    return LinuxFolderPicker::Choose(".", "Choose the folder for your " + what).path;
+#else
+    return "";
+#endif
+}
+}
+
 bool Start(int& argc, char**& argv)
 {
     // "--game IREO" (the desktop shortcuts, shortcuts.h): that game at once, without the list.
@@ -3518,6 +4125,8 @@ bool Start(int& argc, char**& argv)
         direct = argv[2];
         for (char& c : direct) c = (char)toupper((unsigned char)c);
     }
+    else if (argc == 2 && argv[1] && (N3ds::EndsWith(argv[1], ".3ds") || N3ds::EndsWith(argv[1], ".cci") || N3ds::EndsWith(argv[1], ".cia")))
+        directRom = argv[1]; // (a 3DS dump opened with FullDex, "Open With" or a Steam shortcut: the 3DS game, never the DS one)
     else if (argc >= 2)
     {
 #ifdef SSR_GBA
@@ -3566,7 +4175,7 @@ bool Start(int& argc, char**& argv)
     ExtractFuncs(fo);
     SetRomFolder(fo);
     if (const char* ar = getenv("SSR_ANDROID_ROMS")) { fo.roms = ar; fo.saves = fo.roms + "/saves"; fo.art = fo.roms; MakeDir(fo.roms); }
-    if (!fo.roms.empty()) MakeDir(fo.saves);
+    if (!fo.roms.empty() && Launcher::ConfigValue(fo.cfg, "folders_layout") != "tidy") MakeDir(fo.saves); // (FOLDERS: the tidy one made by ResolveFolders)
 #else
     fo.dir = ProgramDir();
     fo.funcs = fo.dir + "/data/funcs";
@@ -3605,6 +4214,9 @@ bool Start(int& argc, char**& argv)
         fo.dir = base + "/pokemon-ds-wide";
         for (size_t i = 1; i <= fo.dir.size(); i++) // (each folder on the way, as mkdir -p)
             if (i == fo.dir.size() || fo.dir[i] == '/') MakeDir(fo.dir.substr(0, i));
+        const std::string app = appImage;
+        const size_t slash = app.rfind('/');
+        if (slash != std::string::npos && slash > 0) fo.besideApp = app.substr(0, slash);
     }
 #endif
     fo.roms = fo.dir + "/roms";
@@ -3639,8 +4251,10 @@ bool Start(int& argc, char**& argv)
         rename(logPath.c_str(), prev.c_str());
     }
     if (freopen(logPath.c_str(), "w", stderr)) setvbuf(stderr, nullptr, _IOLBF, 0);
+    fprintf(stderr, "[launcher] FullDex %s\n", FULLDEX_VERSION);
     fprintf(stderr, "[launcher] folder %s\n", fo.dir.c_str());
     if (fo.saves != fo.dir + "/saves") fprintf(stderr, "[launcher] saves folder %s\n", fo.saves.c_str()); // (SAVES FOLDER, or the phone's ROM folder)
+    ResolveFolders(fo, true);
 
 #ifdef SSR_GBA
     for (int i = 1; i < argc; i++)
@@ -3698,9 +4312,39 @@ bool Start(int& argc, char**& argv)
         if (directGame < 0 && copiedDirectGba && IsGbaRomName(directRom))
             for (size_t i = 0; i < games.size() && directGame < 0; i++)
                 if (sameRom(games[i].rom, copy) && Playable(fo, games[i])) directGame = (int)i;
+#ifdef SSR_N3DS_PC
+        // (A 3DS dump from anywhere: the 3DS game, as if it were with the ROMs; one that cannot be played says why.)
+        if (directGame < 0 && (N3ds::EndsWith(directRom, ".3ds") || N3ds::EndsWith(directRom, ".cci") || N3ds::EndsWith(directRom, ".cia")))
+        {
+            if (const N3ds::Title* t = N3ds::Check(directRom))
+            {
+                for (size_t i = 0; i < games.size() && directGame < 0; i++)
+                    if (games[i].platform == Launcher::N3DS && games[i].code == t->code) directGame = (int)i;
+                if (directGame < 0 && N3ds::ProgramHere())
+                {
+                    games.push_back(N3ds::Make(*t, directRom, fo.dir + "/3ds/" + t->id));
+                    games.back().saveName = N3ds::SaveName(t->code);
+                    games.back().built = N3ds::Prepared(games.back());
+                    directGame = (int)games.size() - 1;
+                }
+                else if (directGame < 0)
+                    N3ds::Skip(directRom, "THE 3DS FOLDER FROM THE FULLDEX DOWNLOAD IS MISSING BESIDE THE PROGRAM", 3);
+            }
+        }
+        else
+#endif
         if (directGame < 0) directGame = DirectRom::Ds(directRom, fo.saves, fo.art, games);
         if (directGame >= 0 && !Playable(fo, games[directGame])) directGame = -1;
         if (directGame < 0) fprintf(stderr, "[launcher] --rom %s: not in the list\n", directRom.c_str());
+#ifdef SSR_N3DS_PC
+        // (A 3DS game whose code is not made yet: the list, with it being made, rather than a game that cannot start.)
+        if (directGame >= 0 && games[directGame].platform == Launcher::N3DS && !N3ds::Prepared(games[directGame]))
+        {
+            chosen = directGame;
+            directGame = -1;
+            if (!N3ds::Busy()) N3ds::StartPrepare(fo.dir, games[chosen]);
+        }
+#endif
     }
 #ifdef SSR_UPDATER
     // (At launch, as the list opens: a popup if a new version is out, never installed unasked.)
@@ -3724,15 +4368,20 @@ bool Start(int& argc, char**& argv)
         }
 #endif
         if (chosen < 0) return false;
+#ifndef __ANDROID__
+        // (#196: a game started directly (a Steam or desktop shortcut, --rom, --game) ends the program when it is
+        // quit, back to Steam or the desktop, rather than opening the list.)
+        g_direct = directGame >= 0;
+#endif
         if (directGame >= 0 && games[chosen].platform != Launcher::N3DS)
         {
-            Launcher::ConfirmHack(games, (size_t)chosen, fo.saves,
-                                  [](const Launcher::Game& g, const std::string& name) { return g.folder + "/" + name; });
+            Launcher::ConfirmHack(games, (size_t)chosen, fo.settings,
+                                  [&fo](const Launcher::Game&, const std::string& name) { return fo.saves + "/" + name; });
             if (Launcher::SavesPlayCheck(games[chosen], fo.saves + "/" + games[chosen].saveName)) { directGame = -1; continue; }
             const std::string error = PrepareLaunch(games[chosen]);
             if (!error.empty()) { fprintf(stderr, "[launcher] %s\n", error.c_str()); directGame = -1; continue; }
         }
-#ifdef _WIN32
+#ifdef SSR_N3DS_PC
         // Omega Ruby or Alpha Sapphire: its own program plays it (n3ds.h), then the list again.
         if (games[chosen].platform == Launcher::N3DS)
         {
@@ -3744,9 +4393,11 @@ bool Start(int& argc, char**& argv)
             }
             DiscordPresence::Playing(Launcher::TitleCase(games[chosen].name));
             const auto start = std::chrono::steady_clock::now();
+            N3ds::SyncSave(games[chosen], fo.saves + "/" + games[chosen].saveName, true); // (a save brought in since the list was made)
             N3ds::Play(fo.dir, games[chosen]);
-            PlayTime::Add(fo.saves, (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count());
+            PlayTime::Add(fo.settings, (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - start).count());
             DiscordPresence::InLauncher();
+            if (g_direct) return false;
             directGame = -1;
             games = FindGames(fo, artCache);
             chosen = 0;
@@ -3770,7 +4421,7 @@ bool Start(int& argc, char**& argv)
         if (games[chosen].platform == Launcher::GBA)
         {
             const std::string rom = games[chosen].rom;
-            LibraryHistory recent;recent.Load(fo.saves+"/fulldex-library.txt");if(Launcher::ConfigValue(fo.cfg,"extra_library_history")=="1")recent.Played(rom);
+            LibraryHistory recent;recent.Load(fo.settings+"/fulldex-library.txt");if(Launcher::ConfigValue(fo.cfg,"extra_library_history")=="1")recent.Played(rom);
             if (FILE* f = fopen(lastPath.c_str(), "w"))
             {
                 fprintf(f, "%s\n", rom.c_str());
@@ -3786,12 +4437,13 @@ bool Start(int& argc, char**& argv)
             Launcher::SyncGbaSettings(fo.cfg, o.data);
             fprintf(stderr, "[launcher] GBA: %s\n", rom.c_str());
             // (Cloud saves: a newer save comes down first; the save goes up when the game closes.)
-            CloudAuto::Start(fo.saves, games[chosen].folder + "/" + games[chosen].saveName);
+            CloudAuto::Start(fo.settings, games[chosen].folder + "/" + games[chosen].saveName);
             const auto gbaStart = std::chrono::steady_clock::now();
             GbaRa::Play(rom, o, fo.cfg);
-            PlayTime::Add(fo.saves, (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - gbaStart).count());
+            PlayTime::Add(fo.settings, (long long)std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - gbaStart).count());
             CloudAuto::Saved();
             CloudAuto::Finish();
+            if (g_direct) return false;
             directGame = -1;
             games = FindGames(fo, artCache);
             chosen = 0;
@@ -3803,10 +4455,10 @@ bool Start(int& argc, char**& argv)
         break;
     }
     g_canChange = true;
-    Launcher::ConfirmHack(games, (size_t)chosen, fo.saves,
-                          [](const Launcher::Game& g, const std::string& name) { return g.folder + "/" + name; });
+    Launcher::ConfirmHack(games, (size_t)chosen, fo.settings,
+                          [&fo](const Launcher::Game&, const std::string& name) { return fo.saves + "/" + name; });
     const Launcher::Game& game = games[chosen];
-    LibraryHistory recent;recent.Load(fo.saves+"/fulldex-library.txt");if(Launcher::ConfigValue(fo.cfg,"extra_library_history")=="1")recent.Played(game.rom);
+    LibraryHistory recent;recent.Load(fo.settings+"/fulldex-library.txt");if(Launcher::ConfigValue(fo.cfg,"extra_library_history")=="1")recent.Played(game.rom);
     if (const Launcher::KnownGame* k = Launcher::Known(game.code)) g_name = game.hack ? Launcher::TitleCase(game.name) : k->name;
     DiscordPresence::Playing(g_name.empty() ? std::string("a game") : g_name);
     if (FILE* f = fopen(lastPath.c_str(), "w"))
@@ -3817,7 +4469,9 @@ bool Start(int& argc, char**& argv)
     fprintf(stderr, "[launcher] %s (game code %s), save %s/%s\n", game.rom.c_str(), game.code.c_str(), fo.saves.c_str(),
         game.saveName.c_str());
     g_args = { argc > 0 && argv[0] ? argv[0] : "pokemon-ds-wide", game.rom, "--save", fo.saves + "/" + game.saveName,
-               "--config", fo.cfg };
+               "--config", fo.cfg, "--cloud-dir", fo.settings };
+    if (!fo.states.empty()) { g_args.push_back("--states"); g_args.push_back(fo.states); } // (FOLDERS)
+    if (!fo.cheats.empty()) { g_args.push_back("--cheats"); g_args.push_back(fo.cheats); }
     if (game.hack) g_args.push_back("--rom-hack"); // (says once that widescreen is tried on it)
     // (Play From Slot, Manage Saves: the game starts from that state.)
     if (!Launcher::PlayState().empty() && game.platform == Launcher::DS && StateSlots::Exists(Launcher::PlayState())) { g_args.push_back("--state-load"); g_args.push_back(Launcher::PlayState()); }
@@ -3874,7 +4528,14 @@ void ChangeGame() { g_change = true; }
 void Finish()
 {
     DiscordPresence::Stop();
-    if (!g_change) return;
+#ifdef SSR_IOS
+    // iOS lets no app start a program (execl fails), and SDL keeps the app open with nothing on
+    // the screen when main ends: that was the black screen after QUIT. The app closes instead,
+    // and opens on the list the next time it is tapped.
+    fflush(stderr);
+    exit(0);
+#endif
+    if (!g_change || g_direct) return; // (#196: a game started directly: the program ends with it)
     fflush(stderr);
     // The program again, without arguments: the list.
 #if defined(__ANDROID__)

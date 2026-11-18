@@ -1,4 +1,9 @@
 #pragma once
+// FullDex's version, shown on the About page and written to the log (releases from 1.6 on are numbered,
+// tagged vMAJOR.MINOR.PATCH). A build can set its own with -DFULLDEX_VERSION="...".
+#ifndef FULLDEX_VERSION
+#define FULLDEX_VERSION "1.6"
+#endif
 #include <pthread.h>
 #include <functional>
 // The game picker of the all-games download (one program for every game): finds the players'
@@ -9,6 +14,8 @@
 #include <algorithm>
 #include <climits>
 #include <filesystem>
+#include "folders.h" // (FOLDERS; here, outside any namespace: saves_page.h, inside one, includes it too)
+#include "regional_profiles.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -307,19 +314,39 @@ struct GlassFocus { int side = -1; int banner = 0; int popup = -1; int popX = 0,
                     // (The settings drawn as a page: its title; where its list and preview go, for the menu.)
                     std::string pageTitle; int sX = 0, sY = 0, sW = 0, sH = 0, sListW = 0, sPvX = 0, sListH = 0, sPvY = 0, pdY = 0, dScroll = 0, dMax = 0; };
 inline GlassFocus& Focus() { static GlassFocus f; return f; }
+// The game menu's platform-launcher item (Add To Steam, or Add To Desktop when Steam is not
+// found): the game list supplies the label because only it knows what is available.
+inline std::function<std::string(const Game&)>& PlatformEntryLabel() { static std::function<std::string(const Game&)> f; return f; }
+// Whether the launcher itself is in Steam ("IN STEAM") or not, for the settings row.
+inline std::function<std::string()>& PlatformLauncherState() { static std::function<std::string()> f; return f; }
+#if defined(__ANDROID__) || (!defined(SSR_PHONE) && !defined(__SWITCH__))
+inline int PopupCount() { return 8; } // (Android's phone home, or the desktop's Steam/Desktop entry)
+#else
 inline int PopupCount() { return 7; }
+#endif
 // The game's menu in the order shown: Play, Manage Saves, Add To Home, Rename, Change Picture, Add To
 // Tab, Remove Game (row -> what it is, PopupLabel's numbers).
-inline int PopupItem(int row) { static const int order[] = { 0, 4, 1, 2, 3, 5, 6 }; return row >= 0 && row < 7 ? order[row] : row; }
+inline int PopupItem(int row) { static const int order[] = { 0, 4, 1, 7, 2, 3, 5, 6 }; return row >= 0 && row < PopupCount() ? (PopupCount() == 8 ? order[row] : order[row < 3 ? row : row + 1]) : row; }
 inline std::string PopupLabel(const Game& g, int i)
 {
-    static const char* n[] = { "Play", "", "Rename", "Change Picture", "Manage Saves", "Add To Tab", "Remove Game" };
+    static const char* n[] = { "Play", "", "Rename", "Change Picture", "Manage Saves", "Add To Tab", "Remove Game", "Add To Phone Home Screen" };
 #ifdef __ANDROID__
     // (A 3DS game inside the app: its game code, from a PC's FullDex Builder or built on the phone.)
     if (g.platform == N3DS && i == 3) return "Use Game Code From PC";
     if (g.platform == N3DS && i == 4) return g.built ? "Game Code Built" : "Build For Best Speed (25 Min)";
 #endif
-    return i == 1 ? (g.favourite ? "Remove From Home" : "Add To Home") : i >= 0 && i < 7 ? n[i] : "";
+    if (i == 7)
+    {
+#if defined(__ANDROID__)
+        return n[7];
+#elif !defined(SSR_PHONE) && !defined(__SWITCH__)
+        if (PlatformEntryLabel()) return PlatformEntryLabel()(g);
+        return "Add To Desktop";
+#else
+        return n[7];
+#endif
+    }
+    return i == 1 ? (g.favourite ? "Remove From Home" : "Add To Home") : i >= 0 && i < 8 ? n[i] : "";
 }
 // The pause menu's keyboard page (Menu::keyGrid) for Rename: BACK, four rows of keys (capitals, small
 // letters or signs: layer), then the two layer keys, SPACE, DELETE and done. ids: each item's key.
@@ -450,6 +477,27 @@ inline std::string HackSave(const std::string& rom)
     if (!k.empty() && k.front() == '-') k.erase(0, 1);
     return "hack-" + (k.empty() ? std::string("game") : k) + ".sav";
 }
+// FullDex 1.6 took some players' own full-size dumps for hacks: the game then played from a copy of its
+// save named after the ROM (hack-....sav). Once the ROM is its game again, a newer one of those is put
+// back as the game's save (the game's own kept beside it as .before-1.6.1), so nothing played since is lost.
+inline void TakeBackHackSave(const std::string& folder, const std::string& hackSave, const std::string& gameSave)
+{
+    const std::string own = folder + "/" + hackSave, base = folder + "/" + gameSave;
+    struct stat a, b;
+    if (stat(own.c_str(), &a) != 0 || a.st_size <= 0) return;
+    const bool haveBase = stat(base.c_str(), &b) == 0;
+    if (haveBase && a.st_mtime <= b.st_mtime) return;
+    if (haveBase)
+    {
+        std::ifstream x(own, std::ios::binary), y(base, std::ios::binary);
+        const std::string sx((std::istreambuf_iterator<char>(x)), {}), sy((std::istreambuf_iterator<char>(y)), {});
+        if (sx == sy) return;
+        if (!RomHacks::CopyFile(base, base + ".before-1.6.1")) return;
+    }
+    if (RomHacks::CopyFile(own, base))
+        fprintf(stderr, "[launcher] %s: the save played since 1.6 put back as %s\n", own.c_str(), base.c_str());
+}
+
 inline std::string HackName(const std::string& rom)
 {
     std::string n;
@@ -704,6 +752,8 @@ inline bool ReadGame(const std::string& rom, const std::string& folder, Game& g)
             g.name = HackName(rom);
             g.saveName = HackSave(rom);
         }
+        else
+            TakeBackHackSave(folder, HackSave(rom), g.saveName);
     }
     else
     {
@@ -1069,7 +1119,51 @@ inline void ConfirmHack(std::vector<Game>& games, size_t index, const std::strin
     if (!k) return;
     RomHacks::Cache cache;
     cache.Load(cacheFolder + "/rom-check.txt");
-    const bool hack = RomHacks::CheckDs(g.rom, g.code, cache, true) == RomHacks::Kind::Modified;
+    bool hack = RomHacks::CheckDs(g.rom, g.code, cache, true) == RomHacks::Kind::Modified;
+    // A regional release (Japanese, Korean, German, Italian ...) plays only as its validated dump:
+    // a hack of one that kept its quick fingerprint (HeartGold Origins, IPKJ, #134) was refused at
+    // the start with "has not been validated". Checked whole here, it plays as a hack instead.
+    const std::string regionalKey = RomHacks::Cache::Key(g.rom, "regional-v1");
+    std::string regionalVerdict;
+    if (!hack && cache.Get(regionalKey, regionalVerdict)) hack = regionalVerdict == "modified";
+    else if (!hack)
+        if (const RegionalProfiles::Profile* p = RegionalProfiles::Find(g.code.c_str()))
+        {
+            // (Read in pieces, not whole: Black 2 is 512 MB, more than a Switch can spare.)
+            if (FILE* f = fopen(g.rom.c_str(), "rb"))
+            {
+                fseek(f, 0, SEEK_END);
+                const long n = ftell(f);
+                fseek(f, 0, SEEK_SET);
+                if (n > 0 && (size_t)n != p->bytes) hack = true;
+                else if (n > 0)
+                {
+                    std::vector<uint8_t> buf(1 << 20);
+                    SHA1_CTX ctx;
+                    SHA1Init(&ctx);
+                    bool header = true, ok = true;
+                    size_t got;
+                    while ((got = fread(buf.data(), 1, buf.size(), f)) > 0)
+                    {
+                        if (header && (got < 0x20 || memcmp(buf.data() + 12, p->code, 4) != 0 || buf[30] != p->revision)) { ok = false; break; }
+                        header = false;
+                        SHA1Update(&ctx, buf.data(), (uint32_t)got);
+                    }
+                    if (ok)
+                    {
+                        unsigned char bytes[20];
+                        SHA1Final(bytes, &ctx);
+                        char digest[41] = {};
+                        static const char hex[] = "0123456789abcdef";
+                        for (int i = 0; i < 20; i++) { digest[2 * i] = hex[bytes[i] >> 4]; digest[2 * i + 1] = hex[bytes[i] & 15]; }
+                        hack = strcmp(digest, p->sha1) != 0;
+                    }
+                    else hack = true;
+                }
+                fclose(f);
+                cache.Put(regionalKey, hack ? "modified" : "clean");
+            }
+        }
     cache.Save(false);
     if (!hack) return;
     g.hack = true;
@@ -1196,6 +1290,8 @@ inline void SyncGbaSettings(const std::string& cfg, const std::string& dataDir)
     set.push_back({ "fast_button", ConfigValue(cfg, "fast_button") == "toggle" ? "toggle" : "hold" });
     const std::string fast = ConfigValue(cfg, "fast_lock");
     if (fast == "0" || fast == "1") set.push_back({ "fast_lock", fast });
+    set.push_back({ "auto_state", ConfigValue(cfg, "auto_state") == "1" ? "1" : "0" });
+    set.push_back({ "auto_resume", ConfigValue(cfg, "auto_resume") == "1" ? "1" : "0" });
     const std::string vol = ConfigValue(cfg, "volume");
     set.push_back({ "volume", vol.empty() ? "100" : vol });
 #ifndef __SWITCH__
@@ -1282,7 +1378,21 @@ inline bool& PortraitNow() { static bool p = false; return p; }
 inline bool& ShortNow() { static bool p = false; return p; }
 inline void Orient(const Canvas& c) { PortraitNow() = c.h > c.w; ShortNow() = PhoneUi() && c.h <= c.w; }
 inline bool PhoneLook() { return PortraitNow() || ShortNow(); } // (a phone, or any upright window: the phone layouts, the Sidebar's own pieces made small)
-inline float GU(const Canvas& c) { return c.h > c.w ? c.w / 405.0f : PhoneUi() ? c.h / 480.0f : c.h / 720.0f; } // one design pixel (the designs are 1280 x 720)
+// (LargeUi: the phone's layouts on a small screen that is not a phone's, for UI SIZE above 100%
+// (ui.h, UiLarge; pc_launcher.cpp sets it): its own unit, and the
+// buttons' hints, as it has buttons and perhaps no touch screen. The layouts are made for the phone's
+// 480 design lines: no larger than 1.5 times, past which their pieces overlap. Not on a phone or the
+// Switch: they have those layouts at that size already.)
+inline bool& LargeUi() { static bool l = false; return l; }
+// A sidebar page's preview (the right of its two boxes): d design pixels wide, at most 45% of the page
+// (a 4:3 screen: the rows keep room, #144), or with LargeUi a share of the page, as d of them took most
+// of it and left the rows' names no room.
+inline int SideRw(int pageW, int d, float u)
+{
+    const int gap = (int)(18 * u);
+    return LargeUi() && d <= 400 ? (int)((pageW - gap) * 0.42f) : std::min((int)(d * u), (pageW - gap) * 45 / 100);
+}
+inline float GU(const Canvas& c) { return c.h > c.w ? c.w / 405.0f : LargeUi() ? c.h / 720.0f * std::min(UiScale(), 1.5f) : PhoneUi() ? c.h / 480.0f : c.h / 720.0f; } // one design pixel (the designs are 1280 x 720)
 inline bool PanelOn(); // (the Panel layout: Launcher > Layout)
 inline bool PanelHome(); // (the Panel layout, on the home screen: the sidebar's pages keep their sidebar)
 inline bool GridOnly();
@@ -1368,7 +1478,14 @@ inline int GlassTabAt(const Canvas& c, int x, int y);
 inline Grid Layout(const Canvas& c)
 {
     Orient(c);
-    Grid g;
+    Grid g{};
+    // Window creation and rotation can query the view before a drawable exists.
+    // Keep its steps valid until a real canvas replaces this temporary layout.
+    if (c.w < 16 || c.h < 16)
+    {
+        g.s = g.tile = g.cols = g.cw = g.ch = g.colStep = g.rowStep = 1;
+        return g;
+    }
     g.s = std::max(1, std::min(c.w, c.h) / 240); // the font's scale: 3 at 720 lines
     if (Glassy(c))
     {
@@ -1392,7 +1509,7 @@ inline Grid Layout(const Canvas& c)
             {
                 g.panelX = (int)(74 * u); g.panelW = c.w - g.panelX - (int)(14 * u); g.gap = (int)(14 * u);
                 // (Rows that scroll down, as on every other screen: they went along in one row.)
-                g.top = (int)(196 * u); g.tile = (int)(150 * u); g.cw = g.tile + (int)(16 * u); g.ch = g.tile + (int)(38 * u); g.bottom = c.h - (int)(10 * u);
+                g.top = (int)(196 * u); g.tile = (int)(150 * u); g.cw = g.tile + (int)(16 * u); g.ch = g.tile + (int)(38 * u); g.bottom = c.h - (int)((LargeUi() ? 36 : 10) * u); // (LargeUi: above the buttons' hints)
                 if (GridOnly()) g.top = (int)(66 * u);
                 g.cols = std::max(1, (g.panelW + g.gap) / (g.cw + g.gap)); g.gx = g.panelX; g.colStep = g.cw + g.gap; g.rowStep = g.ch + g.gap;
                 g.horiz = false;
@@ -1621,7 +1738,9 @@ inline int SideIcon(int i)
     static const int ic[] = { Glass::I_HOME, Glass::I_PEOPLE, Glass::I_CHIP, Glass::I_GEAR, Glass::I_LAYOUT, Glass::I_INFO };
     return ic[i];
 }
-inline int GPx(float px) { return std::max(6, (int)(px + 0.5f)); }
+// (Larger menus: UiMinPx, as the pages' small print, rows' second lines and the previews'
+// paragraphs, was drawn at 9 to 12.)
+inline int GPx(float px) { return std::max(6, UiMinPx((int)(px + 0.5f))); }
 // (Each in the player's language: LauncherText.)
 inline int GW(const std::string& s, float px, bool bold) { return CleanFont::Width(LauncherText::Tr(s), GPx(px), bold); }
 // Text with its capitals centred on cy.
@@ -2599,6 +2718,7 @@ struct HubState
     CloudSaves::Settings set;
     int busy = 0;                           // 0 nothing, 1 signing in, 2 syncing
     std::string code, url, msg;             // signing in: the code and where to type it; the last word
+    bool needSignIn = false;                // the cloud says the Google sign-in is no longer good
     std::map<std::string, CloudSaves::Result> results; // by the save's path
     std::map<std::string, std::string> synced;          // the saves in the cloud (cloud-state.txt): name, as last synced
     std::atomic<int> version{ 0 };
@@ -3301,6 +3421,7 @@ inline bool HubEnter(int row)
     if (row == 0) { HubMode() = 1; F.prow = 0; }
     else if (row == 2) { HubMode() = 2; F.prow = 2; }
     else if (row == 3) return false; // (Discord: a link, nothing to open here)
+    else if (row == 4) { HubMode() = 4; F.prow = 0; } // (COMBINED POKEDEX)
     else { MoverShow(true); F.prow = MOVER_FIRST; }
     F.pact = -1; F.rScroll = 0;
     Hub().version++;
@@ -4399,13 +4520,30 @@ inline int ThemePick(const std::string& pick)
 // (The Fulldex Discord: people to trade with, help, news. The Hub's last row.)
 static const char* const kDiscordUrl = "https://discord.gg/pnGeMYyJR";
 static const char* const kReleasesUrl = "https://github.com/mamesj/pokemon-fulldex/releases";
-inline int HubRows() { return Mover().open ? MoverRows() : HubMode() == 0 ? 4 : HubMode() == 2 ? TradeRows() : HubMode() == 3 ? SavesRows() : HUB_FIRST + (int)HubGames().size(); }
+#ifdef SSR_POKEMON_HUB
+inline int DexPageRows(); // (dex_page.h)
+#endif
+inline int HubTopRows()
+{
+#ifdef SSR_POKEMON_HUB
+    return 5; // (and COMBINED POKEDEX, #165)
+#else
+    return 4;
+#endif
+}
+inline int HubRows()
+{
+#ifdef SSR_POKEMON_HUB
+    if (!Mover().open && HubMode() == 4) return DexPageRows();
+#endif
+    return Mover().open ? MoverRows() : HubMode() == 0 ? HubTopRows() : HubMode() == 2 ? TradeRows() : HubMode() == 3 ? SavesRows() : HUB_FIRST + (int)HubGames().size();
+}
 inline std::vector<std::string> HubActions(int row)
 {
     if (Mover().open) return MoverActions(row);
     if (HubMode() == 2) return TradeActions(row);
     if (HubMode() == 3) return SavesDs() ? std::vector<std::string>(10, "Slot") : std::vector<std::string>(); // (Manage Saves: its slots)
-    if (HubMode() == 0) return {};
+    if (HubMode() == 0 || HubMode() == 4) return {};
     HubLoad();
     const std::vector<HubGame> games = HubGames();
     HubState& h = Hub();
@@ -4415,6 +4553,7 @@ inline std::vector<std::string> HubActions(int row)
         if (h.busy == 1) return { "Cancel" };
         if (h.busy) return {};
         if (!HubOnLocked(h)) return { "Sign In With Google" };
+        if (h.needSignIn) return { "Sign In With Google", "Sign Out" };
         return { "Sync All Now", "Sign Out" };
     }
     if (!HubOnLocked(h) || h.busy || row - HUB_FIRST >= (int)games.size()) return {};
@@ -4431,6 +4570,7 @@ inline void HubSyncJob(std::vector<std::string> paths, int resolve)
     { std::lock_guard<std::mutex> l(h.m); s = h.set; dir = h.dir; }
     std::unique_ptr<CloudSaves::Sync> sync = CloudSaves::FromSettings(s, dir + "/cloud-state.txt", HubDevice());
     int up = 0, down = 0, both = 0, failed = 0;
+    std::string firstError;
     for (const std::string& p : paths)
     {
         if (h.stop) break;
@@ -4446,16 +4586,24 @@ inline void HubSyncJob(std::vector<std::string> paths, int resolve)
         down += r.outcome == CloudSaves::Outcome::Pulled;
         both += r.outcome == CloudSaves::Outcome::Conflict;
         failed += r.outcome == CloudSaves::Outcome::Failed;
+        if (r.outcome == CloudSaves::Outcome::Failed && firstError.empty()) firstError = r.message;
         { std::lock_guard<std::mutex> l(h.m); h.results[p] = r; }
         h.version++;
     }
     std::lock_guard<std::mutex> l(h.m);
     h.busy = 0;
     HubReadState(h);
-    if (!sync) h.msg = "Cloud saves are not set up.";
-    else if (failed) h.msg = "Could not reach " + std::string(HubProvider(s.provider)) + ". The saves here are kept, and sync next time.";
+    if (!sync) { h.needSignIn = false; h.msg = "Cloud saves are not set up."; }
+    else if (failed)
+    {
+        h.needSignIn = firstError.find("SIGN IN AGAIN") != std::string::npos;
+        h.msg = "Could not reach " + std::string(HubProvider(s.provider)) +
+                (firstError.empty() ? std::string() : ": " + SettingSentence(firstError)) +
+                ". The saves here are kept, and sync next time.";
+    }
     else
     {
+        h.needSignIn = false;
         h.msg = "Synced.";
         if (up) h.msg += " " + std::to_string(up) + " sent up.";
         if (down) h.msg += " " + std::to_string(down) + " brought down.";
@@ -4477,7 +4625,12 @@ inline void HubSignInJob(std::vector<std::string> paths)
     if (client.id.empty()) { done("This build of Fulldex has no Google sign-in built in."); return; }
     CloudSaves::SignIn in;
     std::string err, refresh;
-    if (!CloudSaves::GoogleSignInStart(client, in, err)) { done("Could not reach Google. Check the internet connection and try again."); return; }
+    if (!CloudSaves::GoogleSignInStart(client, in, err))
+    {
+        done(err.empty() ? "Could not reach Google. Check the internet connection and try again."
+                         : "Could not sign in to Google: " + SettingSentence(err) + ".");
+        return;
+    }
     {
         std::lock_guard<std::mutex> l(h.m);
         h.code = in.userCode; h.url = in.verificationUrl; h.msg.clear();
@@ -4497,6 +4650,7 @@ inline void HubSignInJob(std::vector<std::string> paths)
                 h.set.googleRefreshToken = refresh;
                 if (h.set.deviceName.empty()) h.set.deviceName = HubDevice();
                 CloudSaves::SaveSettings(h.dir + "/cloud.ini", h.set);
+                h.needSignIn = false;
                 h.busy = 2; h.code.clear(); h.url.clear(); h.msg = "Signed in. Syncing your saves...";
                 h.version++;
             }
@@ -4505,7 +4659,13 @@ inline void HubSignInJob(std::vector<std::string> paths)
         }
         if (st == CloudSaves::SignInState::SlowDown) in.interval += 5;
         else if (st == CloudSaves::SignInState::Denied) { done("Sign-in was turned down on the phone."); return; }
-        else if (st != CloudSaves::SignInState::Waiting) { done(st == CloudSaves::SignInState::Expired ? "The code ran out. Choose Sign In again for a new one." : "Sign-in did not work. Try again."); return; }
+        else if (st != CloudSaves::SignInState::Waiting)
+        {
+            if (st == CloudSaves::SignInState::Expired) done("The code ran out. Choose Sign In again for a new one.");
+            else if (err.empty()) done("Sign-in did not work. Try again.");
+            else done("Sign-in did not work: " + SettingSentence(err) + ".");
+            return;
+        }
     }
     done(h.cancel ? "Sign-in cancelled." : "The code ran out. Choose Sign In again for a new one.");
 }
@@ -4542,6 +4702,7 @@ inline std::string HubDo(int row, int act)
         h.set.googleRefreshToken.clear();
         const bool ok = CloudSaves::SaveSettings(h.dir + "/cloud.ini", h.set);
         h.results.clear();
+        h.needSignIn = false;
         h.msg = ok ? "Signed out. Your saves stay here, and in your Drive." : "Could not save the cloud settings.";
         h.version++;
         return "";
@@ -4642,6 +4803,7 @@ inline void OpenSupportAsk()
     F.dPaths = { "#open:https://buymeacoffee.com/mamesj", "#open:https://paypal.me/mamesj", "#close" };
 }
 #include "saves_page.h"
+#include "dex_page.h" // (COMBINED POKEDEX: the Hub's fifth row)
 inline std::string SavesTitle() { return LauncherText::Tr("Manage Saves") + "   \xC2\xB7   " + Saves().name; }
 inline int PageRows(int page) { return page == SIDE_LAUNCHER ? LauncherRows() : page == SIDE_ABOUT ? 5 : page == SIDE_ROMS ? std::max(1, (int)RomList().size()) : page == SIDE_HUB ? HubRows() : 0; }
 // The cards of the About page that open a page when tapped, as drawn (cleared each frame it is drawn).
@@ -4773,7 +4935,7 @@ inline bool PageBack()
     if (F.page == SIDE_HUB && F.side < 0 && F.pact < 0 && Mover().open && Mover().swapping) { Mover().swapping = false; Mover().put = -1; Mover().msg.clear(); Hub().version++; return true; }
     if (F.page == SIDE_HUB && F.side < 0 && F.pact < 0 && Mover().open) { MoverShow(false); HubMode() = 0; F.prow = 1; F.rScroll = 0; return true; }
     if (F.page == SIDE_HUB && F.side < 0 && F.pact < 0 && HubMode() == 2) { HubLink::Leave(); HubMode() = 0; F.prow = 2; F.rScroll = 0; Hub().version++; return true; }
-    if (F.page == SIDE_HUB && F.side < 0 && F.pact < 0 && HubMode() != 0) { HubMode() = 0; F.prow = 0; F.rScroll = 0; Hub().version++; return true; }
+    if (F.page == SIDE_HUB && F.side < 0 && F.pact < 0 && HubMode() != 0) { F.prow = HubMode() == 4 ? 4 : 0; HubMode() = 0; F.rScroll = 0; Hub().version++; return true; }
     if ((F.page == SIDE_ROMS || F.page == SIDE_HUB) && F.side < 0 && F.pact >= 0) { F.pact = -1; return true; }
     if (TilesOn()) { const int pg = F.page; F.page = -1; F.side = pg; return true; } // (the window closed: back on the tile that opened it)
     if (F.side < 0) F.side = F.page;
@@ -5049,16 +5211,16 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
     const uint32_t text = Menu::GlassText, hint = Menu::GlassHint;
     const bool portP = PhoneLook() && c.h > c.w; // (upright: a thin bar over the page)
     const int barH = portP ? (int)(44 * u) : sp.tabsY * 2 + sp.tabsH;
-    const int L = sp.bannerX, R = sp.bannerX + sp.bannerW, top = sp.pageTop > 0 ? sp.pageTop : barH + (int)((portP ? 10 : 18) * u), bottom = sp.pageBottom > 0 ? sp.pageBottom : PhoneLook() && c.h > c.w && sp.navY > 0 ? sp.navY - (int)(12 * u) : c.h - (int)((ShortNow() ? 14 : 64) * u); // (a phone sideways: the panels run to the foot of the screen, the back button is in the bar)
+    const int L = sp.bannerX, R = sp.bannerX + sp.bannerW, top = sp.pageTop > 0 ? sp.pageTop : barH + (int)((portP ? 10 : 18) * u), bottom = sp.pageBottom > 0 ? sp.pageBottom : PhoneLook() && c.h > c.w && sp.navY > 0 ? sp.navY - (int)(12 * u) : c.h - (int)((LargeUi() ? 38 : ShortNow() ? 14 : 64) * u); // (a phone sideways: the panels run to the foot of the screen, the back button is in the bar)
     const float titleY = sp.pageTitleY > 0 ? (float)sp.pageTitleY : barH * 0.5f;
-    GT(c, sp.tabsX + (int)(6 * u), titleY, F.page == SIDE_ROMS ? "ROMs" : F.page == SIDE_HUB ? (Mover().open ? "Move Pok\xC3\xA9mon" : HubMode() == 1 ? "Cloud Saves" : HubMode() == 2 ? "Trade" : HubMode() == 3 ? SavesTitle() : std::string("Hub")) : F.page == SIDE_SETTINGS ? (F.pageTitle.empty() ? std::string("Settings") : F.pageTitle) : F.page == SIDE_LAUNCHER ? (LauncherMode() == 1 ? "Theme Editor" : LauncherMode() == 2 ? "My Themes" : LauncherMode() == 3 ? "Theme Library" : LauncherMode() == 5 ? "Theme Gallery" : LauncherMode() == 4 ? "Font" : "Launcher") : "About", 26 * u, text, true);
+    GT(c, sp.tabsX + (int)(6 * u), titleY, F.page == SIDE_ROMS ? "ROMs" : F.page == SIDE_HUB ? (Mover().open ? "Move Pok\xC3\xA9mon" : HubMode() == 1 ? "Cloud Saves" : HubMode() == 2 ? "Trade" : HubMode() == 3 ? SavesTitle() : HubMode() == 4 ? std::string("Pok\xC3\xA9" "dex") : std::string("Hub")) : F.page == SIDE_SETTINGS ? (F.pageTitle.empty() ? std::string("Settings") : F.pageTitle) : F.page == SIDE_LAUNCHER ? (LauncherMode() == 1 ? "Theme Editor" : LauncherMode() == 2 ? "My Themes" : LauncherMode() == 3 ? "Theme Library" : LauncherMode() == 5 ? "Theme Gallery" : LauncherMode() == 4 ? "Font" : "Launcher") : "About", 26 * u, text, true);
     const std::string where = std::string("Fulldex   \xC2\xB7   ") + PlatformLabel();
     if (!ShortNow() && !portP) GT(c, R - GW(where, 16 * u, true), titleY, where, 16 * u, hint, true);
     if (F.page == SIDE_ROMS)
     {
         const std::vector<Game>& roms = RomList();
         const int n = (int)roms.size();
-        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)(340 * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.38f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
+        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, 340, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.38f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
         const int rowH = (int)(46 * u), rg = (int)(6 * u);
         auto status = [&](const Game& g, uint32_t& col) -> std::string {
             if (g.hidden) { col = 0xFFAEB7C4u; return "Hidden"; }
@@ -5148,8 +5310,16 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         const int dTopC = dTopP - (stkP ? F.dScroll : 0);
         ClipGuard clipG(c, F, stkP ? dTopP : 0, stkP ? bottom : c.h, (int)(16 * u));
         F.aW = 0;
-        const int ix = dx + (int)(18 * u), iw = rw - (int)(36 * u), ps = (int)(110 * u);
+        const int ix = dx + (int)(18 * u), iw = rw - (int)(36 * u);
+        const int romAh = (int)((LargeUi() ? 34 : 44) * u), romAg = (int)((LargeUi() ? 4 : 6) * u); // (LargeUi: room for the details and the buttons under them)
         int y = dTopC + (int)(18 * u);
+        // (A short panel, as on a 4:3 screen: the cover smaller and the details' second row left out,
+        // so nothing runs under the buttons at the foot, #144.)
+        const bool upright = PhoneLook() && c.h > c.w;
+        const int actTop = bottom - (int)(18 * u) - RomActions() * romAh - (RomActions() - 1) * romAg - (int)(8 * u);
+        const int room = upright ? 1 << 30 : actTop - y;
+        const int ps = std::clamp(room - (int)(22 * u) - 2 * (int)(48 * u) - (int)(10 * u), (int)((LargeUi() ? 80 : 92) * u), (int)(110 * u)); // (92: the name, platform and status beside it; LargeUi: 80, for the details and the buttons under them)
+        const int cellRows = upright || ps + (int)(22 * u) + 2 * (int)(48 * u) <= room ? 2 : 1;
         if (n > 0)
         {
             const Game& g = roms[F.prow];
@@ -5168,14 +5338,16 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             else snprintf(size, sizeof size, "-");
             const std::string cells[4][2] = { { "Size", size }, { "Save", g.hasSave ? "Found" : "None Yet" },
                                               { "Game Code", g.code.empty() ? "-" : g.code }, { "Save File", g.saveName.empty() ? "-" : g.saveName } };
-            for (int i = 0; i < 4; i++)
+            // (One row only: the four side by side when the panel is wide enough, else the first two.)
+            const int cols = cellRows == 1 && iw >= (int)(4 * 96 * u) ? 4 : 2;
+            for (int i = 0; i < std::min(4, cols * cellRows); i++)
             {
-                const int cx = ix + (i % 2) * (iw / 2), cy = y + (i / 2) * (int)(48 * u);
+                const int cx = ix + (i % cols) * (iw / cols), cy = y + (i / cols) * (int)(48 * u);
                 GT(c, cx, cy + 8 * u, cells[i][0], 12 * u, hint, true);
-                GT(c, cx, cy + 28 * u, fit(cells[i][1], 15 * u, true, iw / 2 - (int)(8 * u)), 15 * u, text, true);
+                GT(c, cx, cy + 28 * u, fit(cells[i][1], 15 * u, true, iw / cols - (int)(8 * u)), 15 * u, text, true);
             }
-            y += 2 * (int)(48 * u) + (int)(10 * u);
-            const int yLim = bottom - (int)(18 * u) - RomActions() * (int)(44 * u) - (RomActions() - 1) * (int)(6 * u) - (int)(8 * u);
+            y += cellRows * (int)(48 * u) + (int)(10 * u);
+            const int yLim = bottom - (int)(18 * u) - RomActions() * romAh - (RomActions() - 1) * romAg - (int)(8 * u);
             if (y + (int)(40 * u) < yLim)
             {
                 GT(c, ix, y + 8 * u, "File", 12 * u, hint, true);
@@ -5194,7 +5366,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         }
         {
             // Folder selection is available independently of the chosen ROM.
-            const int na = RomActions(), ah = (int)(44 * u), ag = (int)(6 * u);
+            const int na = RomActions(), ah = romAh, ag = romAg;
             const int ay = std::max(bottom - (int)(18 * u) - na * ah - (na - 1) * ag, PhoneLook() && c.h > c.w ? y + (int)(10 * u) : 0); // (upright: under the writing, the panel scrolling to them)
             F.aX = ix; F.aY = ay; F.aW = iw; F.aRow = ah + ag;
             std::vector<std::string> labels;
@@ -5238,7 +5410,9 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             F.sX = L; F.sY = top; F.sW = R - L; F.sH = bottom - top; F.sListW = R - L; F.sPvX = L; F.sListH = lh; F.sPvY = top + lh + gap;
             return;
         }
-        const int rw = (int)(400 * u), lw2 = R - L - rw - gap;
+        // (LargeUi: the preview a share of a short screen, not its fixed width, which left the rows a
+        // letter of their names.)
+        const int rw = LargeUi() ? (int)((R - L - gap) * 0.37f) : std::min((int)(400 * u), (R - L - gap) * 45 / 100), lw2 = R - L - rw - gap; // (a 4:3 screen: the rows keep room, #144)
         Menu::FrostBox(c, solid, L, top, lw2, bottom - top, 18 * u);
         F.sX = L; F.sY = top; F.sW = R - L; F.sH = bottom - top; F.sListW = lw2; F.sPvX = R - rw; F.sListH = 0; F.sPvY = 0;
         return;
@@ -5279,7 +5453,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         const std::vector<int> mons;
 #endif
         const int n = TradeRows();
-        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)(380 * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
+        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, 380, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
         const int rowH = (int)(46 * u), rg = (int)(6 * u);
         Menu::FrostBox(c, solid, L, top, lw2, lhP, 18 * u);
         const int vis = std::max(1, ( lhP - 2 * pad + rg) / (rowH + rg));
@@ -5654,7 +5828,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         {
             // Its menu, or My Themes: rows, and right of them what the chosen one is (a theme: its picture).
             ThemeState& ts = Themes();
-            const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)(400 * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(14 * u);
+            const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, 400, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(14 * u);
             int rowH = (int)(58 * u), rg = (int)(8 * u);
             const int n = LauncherRows();
             // (The menu's rows all in view when the screen is short, as on a phone held sideways.)
@@ -5825,7 +5999,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             if (!ts.msg.empty()) para(ts.msg, 0xFF8CC8FFu, 13 * u);
             return;
         }
-        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)((ShortNow() && LauncherMode() == 1 && Look().edit >= 0 ? 560 : 400) * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * (Look().edit >= 0 ? 0.17f : 0.55f)) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(14 * u); // (A phone sideways, a row open: a wider page, so the colour wheel can be big beside the bars)
+        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, ShortNow() && LauncherMode() == 1 && Look().edit >= 0 ? 560 : 400, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * (Look().edit >= 0 ? 0.17f : 0.55f)) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(14 * u); // (A phone sideways, a row open: a wider page, so the colour wheel can be big beside the bars)
         const int rowH = (int)(46 * u), rg = (int)(6 * u), n = 11;
         Menu::FrostBox(c, solid, L, top, lw2, lhP, 18 * u);
         if (lk.edit >= 0) F.prow = lk.edit == 8 ? 9 : lk.edit;
@@ -6043,6 +6217,9 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         return;
     }
     if (F.page == SIDE_HUB && !Mover().open && HubMode() == 3) { DrawSavesPage(c, solid, u, L, R, top, bottom); return; } // (Manage Saves)
+#ifdef SSR_POKEMON_HUB
+    if (F.page == SIDE_HUB && !Mover().open && HubMode() == 4) { DrawDexPage(c, solid, u, L, R, top, bottom); return; } // (COMBINED POKEDEX)
+#endif
     if (F.page == SIDE_HUB && !Mover().open && HubMode() == 0)
     {
         // The Hub's first page: what it holds, each opened with A.
@@ -6062,8 +6239,8 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         }
         lk.unlock();
         const int moverGames = (int)MoverGames().size();
-        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)(400 * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(14 * u);
-        const int rowH = (int)(72 * u), rg = (int)(10 * u), n = 4;
+        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, 400, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(14 * u);
+        const int n = HubTopRows(), rowH = (int)((n > 4 ? 64 : 72) * u), rg = (int)((n > 4 ? 8 : 10) * u);
         const HubLink::Status link = HubLink::Snapshot();
         Menu::FrostBox(c, solid, L, top, lw2, lhP, 18 * u);
         F.prow = std::max(0, std::min(F.prow, n - 1));
@@ -6106,13 +6283,25 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
                 st = "Join";
                 col = 0xFF8CC8FFu;
             }
+#ifdef SSR_POKEMON_HUB
+            else if (i == 4)
+            {
+                const CombinedDex& dex = DexNow();
+                int seen = 0, caught = 0;
+                DexCount(dex, DexRows()[0], seen, caught);
+                name = "Pok\xC3\xA9" "dex";
+                sub = "All your games' Pok\xC3\xA9" "dexes together";
+                st = std::to_string(caught) + " Caught";
+                col = 0xFF8FE3A2u;
+            }
+#endif
             else
             {
                 name = "Move Pok\xC3\xA9mon";
                 sub = "Between your own games, as a trade would";
                 st = std::to_string(moverGames) + (moverGames == 1 ? " Save" : " Saves");
             }
-            Glass::DrawIcon(c, i == 0 ? Glass::I_GLOBE : i == 2 ? Glass::I_PEOPLE : i == 3 ? Glass::I_CHAT : Glass::I_POKEBALL, rx + 30 * u, mid, 12 * u, text);
+            Glass::DrawIcon(c, i == 0 ? Glass::I_GLOBE : i == 2 ? Glass::I_PEOPLE : i == 3 ? Glass::I_CHAT : i == 4 ? Glass::I_GRID : Glass::I_POKEBALL, rx + 30 * u, mid, 12 * u, text);
             GT(c, rx + (int)(60 * u), mid - 11 * u, name, 18 * u, text, true);
             const int chipW = GW(st, 12 * u, true) + (int)(20 * u), chipX = rx + rww - (int)(46 * u) - chipW;
             GTFit(c, rx + (int)(60 * u), mid + 13 * u, sub, 13 * u, chipX - (rx + (int)(60 * u)) - (int)(12 * u), hint, false);
@@ -6137,7 +6326,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             GT(c, cx, cy + 28 * u, v, 15 * u, text, true);
             (void)cw;
         };
-        GT(c, ix, y + 14 * u, F.prow == 0 ? "Cloud Saves" : F.prow == 2 ? "Trade" : F.prow == 3 ? "Fulldex Discord" : "Move Pok\xC3\xA9mon", 22 * u, text, true);
+        GT(c, ix, y + 14 * u, F.prow == 0 ? "Cloud Saves" : F.prow == 2 ? "Trade" : F.prow == 3 ? "Fulldex Discord" : F.prow == 4 ? "Pok\xC3\xA9" "dex" : "Move Pok\xC3\xA9mon", 22 * u, text, true);
         y += (int)(44 * u);
         if (F.prow == 0)
         {
@@ -6157,6 +6346,20 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             }
             if (!msg.empty()) para(msg, busy ? 0xFF8CC8FFu : hint, 13 * u);
         }
+#ifdef SSR_POKEMON_HUB
+        else if (F.prow == 4)
+        {
+            const CombinedDex& dex = DexNow();
+            int seen = 0, caught = 0;
+            const DexRegion all = DexRows()[0];
+            DexCount(dex, all, seen, caught);
+            cell(ix, y, iw / 2, "Caught", std::to_string(caught) + " of " + std::to_string(all.last));
+            cell(ix + iw / 2, y, iw / 2, "Seen", std::to_string(seen));
+            y += (int)(60 * u);
+            para("Every Pok\xC3\xA9mon caught or seen in any of your games, in one Pok\xC3\xA9" "dex: the National one and each region's.", text, 14 * u);
+            para(std::to_string(dex.games.size()) + (dex.games.size() == 1 ? " game counted." : " games counted.") + " Open it to see each Pok\xC3\xA9mon.", hint, 13 * u);
+        }
+#endif
         else if (F.prow == 2)
         {
             para("Trade with a friend, online or on the same Wi-Fi, or send Pok\xC3\xA9mon to another of your own devices: a PC and a Switch, say.", text, 14 * u);
@@ -6226,7 +6429,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         const std::vector<int> mons;
 #endif
         const int n = MoverRows();
-        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)(360 * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
+        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, 360, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
         const int rowH = (int)(46 * u), rg = (int)(6 * u);
         Menu::FrostBox(c, solid, L, top, lw2, lhP, 18 * u);
         const int vis = std::max(1, ( lhP - 2 * pad + rg) / (rowH + rg));
@@ -6441,7 +6644,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         };
         auto fileOf = [](const std::string& p) { const size_t k = p.find_last_of("/\\"); return k == std::string::npos ? p : p.substr(k + 1); };
         const int n = HUB_FIRST + (int)games.size();
-        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : (int)(360 * u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
+        const bool stkP = PhoneLook() && c.h > c.w; const int rw = stkP ? R - L : SideRw(R - L, 360, u), gap = (int)(18 * u), lw2 = stkP ? R - L : R - L - rw - gap, lhP = stkP ? (int)((bottom - top) * 0.55f) : bottom - top, dTopP = stkP ? top + lhP + gap : top, dHP = stkP ? bottom - dTopP : bottom - top, pad = (int)(12 * u);
         const int rowH = (int)(46 * u), rg = (int)(6 * u);
         // The list: the account, then each game's save.
         Menu::FrostBox(c, solid, L, top, lw2, lhP, 18 * u);
@@ -6574,6 +6777,10 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             case CloudSaves::Outcome::Pushed: para("This save was sent up to the cloud.", text, 14 * u); break;
             case CloudSaves::Outcome::Pulled: para("A newer save from " + cloudDev + " was brought down. The one that was here is in the backups.", text, 14 * u); break;
             case CloudSaves::Outcome::NothingYet: para("There is no save for this game yet, here or in the cloud.", hint, 14 * u); break;
+            case CloudSaves::Outcome::Failed:
+                para((r->message.empty() ? std::string("Could not reach the cloud.") : SettingSentence(r->message)) +
+                     " The save here is kept, and syncs next time.", hint, 14 * u);
+                break;
             default: para("Could not reach the cloud. The save here is kept, and syncs next time.", hint, 14 * u); break;
             }
             GT(c, ix, y + 8 * u, "Save File", 12 * u, hint, true);
@@ -6614,7 +6821,8 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
     }
     // The sections.
     const bool stkA = PhoneLook() && c.h > c.w;
-    const int lw = stkA ? R - L : (int)(300 * u), pad = (int)(12 * u), rowH = (int)((stkA ? 40 : 50) * u), rg = (int)((stkA ? 4 : 6) * u);
+    // (LargeUi: the list narrower, its names being short; the sections need the room.)
+    const int lw = stkA ? R - L : LargeUi() ? (int)((R - L) * 0.32f) : (int)(300 * u), pad = (int)(12 * u), rowH = (int)((stkA ? 40 : 50) * u), rg = (int)((stkA ? 4 : 6) * u);
     const int lhA = stkA ? 5 * (rowH + rg) + 2 * pad : bottom - top, pTop = stkA ? top + lhA + (int)(18 * u) : top;
     Menu::FrostBox(c, solid, L, top, lw, lhA, 18 * u);
     static const char* names[] = { "Support", "Credits", "Report A Bug", "Licences", "Website" };
@@ -6637,7 +6845,7 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         const int cx = L + pad, cy = top + lhA - pad - ch, cw = lw - 2 * pad;
         if (cy >= top + pad + 5 * (rowH + rg)) { // (not on a short screen: it would be drawn over the rows)
         Glass::Round(c, cx, cy, cw, ch, 12 * u, SettingsArt::Row, 0x3DFFFFFF, 1.0f * u);
-        GT(c, cx + (int)(14 * u), cy + 24 * u, "Fulldex", 20 * u, text, true);
+        GT(c, cx + (int)(14 * u), cy + 24 * u, (std::string("FullDex ") + FULLDEX_VERSION).c_str(), 20 * u, text, true);
         GT(c, cx + (int)(14 * u), cy + 48 * u, PlatformLabel(), 14 * u, hint, true);
         int ly = cy + (int)(70 * u);
         for (const std::string& l : lines) { GT(c, cx + (int)(14 * u), ly, l, 13 * u, hint, false); ly += (int)(18 * u); }
@@ -6706,7 +6914,9 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
 #ifdef __ANDROID__
         const int qs = 0; // (no QR codes on Android: the links are there to choose)
 #else
-        const int qs = std::max((int)(80 * u), std::min(cw - (int)(60 * u), bottom - ip - (y + (stkA ? F.dScroll : 0) + ch + (int)(14 * u)) - (int)(30 * u)));
+        // (No room for them under the cards, as on a 4:3 screen: the codes left out, the links stay. #144)
+        const int qroom = bottom - ip - (y + (stkA ? F.dScroll : 0) + ch + (int)(14 * u)) - (int)(30 * u);
+        const int qs = qroom < (int)(80 * u) && !stkA ? 0 : std::max((int)(80 * u), std::min(cw - (int)(60 * u), qroom));
 #endif
         const char* names2[2] = { "Buy Me A Coffee", "PayPal" };
         const char* where[2] = { "buymeacoffee.com/mamesj", "paypal.me/mamesj" };
@@ -6715,11 +6925,13 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
             const int cx = px + ip + i * (cw + gap);
             card(cx, y, cw, ch, names2[i], where[i]);
             link(cx, y, cw, ch, i == 0 ? "https://buymeacoffee.com/mamesj" : "https://paypal.me/mamesj");
+            if (qs <= 0) continue;
             if (i == 0) DrawQr(c, kBeerQr, kBeerQrSize, cx + (cw - qs) / 2, y + ch + (int)(14 * u), qs);
             else DrawQr(c, kPaypalQr, kPaypalQrSize, cx + (cw - qs) / 2, y + ch + (int)(14 * u), qs);
         }
-        y += ch + (int)(14 * u) + qs + (int)(14 * u);
+        y += ch + (int)(14 * u) + (qs > 0 ? qs + (int)(14 * u) : 0);
         TextLow() = std::max(TextLow(), y);
+        if (!(LargeUi() && qs <= 0)) // (no codes: nothing to scan, and no room for the line under the panel)
 #ifdef __SWITCH__
         GT(c, px + ip, y + 8 * u, "Scan a code with your phone's camera.", 13 * u, hint, true);
 #else
@@ -6727,32 +6939,43 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
 #ifdef __ANDROID__
             "Choose Support to open Buy Me A Coffee or PayPal."
 #else
-            "Choose Support to open Buy Me A Coffee, or scan a code with your phone."
+            (qs > 0 ? "Choose Support to open Buy Me A Coffee, or scan a code with your phone." : "Choose Support to open Buy Me A Coffee or PayPal.")
 #endif
-            , 13 * u, pw - 2 * ip)) { GT(c, px + ip, hy2, hl, 13 * u, hint, true); hy2 += (int)(18 * u); } }
+            , 13 * u, pw - 2 * ip)) { if (hy2 + (int)(8 * u) > bottom - ip) break; GT(c, px + ip, hy2, hl, 13 * u, hint, true); hy2 += (int)(18 * u); } } // (only the lines that fit, #144)
 #endif
     }
     else if (F.prow == 1)
     {
         heading("Credits And Acknowledgements");
-        static const char* const creditUrl[10] = { "https://github.com/ClickingMaster/ssrecomp", "https://github.com/melonDS-emu/melonDS", "https://mgba.io",
+        static const char* const creditUrl[18] = { "https://github.com/ClickingMaster/ssrecomp", "https://github.com/melonDS-emu/melonDS", "https://mgba.io",
             "https://github.com/lidor30/pokedaisy", "https://github.com/fuddlesworth/pokebw2", "https://gbatemp.net/threads/deadskullzjrs-nds-cheat-databases.488711/",
-            "https://github.com/ITotalJustice/sphaira", "", "", "" };
+            "https://github.com/ITotalJustice/sphaira", "", "", "", "", "", "", "", "", "", "", "" };
         static const char* credits[][2] = {
             { "ssrecomp by ClickingMaster", "The single-screen and widescreen view Fulldex grew from" },
             { "melonDS", "The DS emulation" },
             { "mGBA", "The GBA games, through Pok\xC3\xA9mon GBA Widescreen" },
-            { "Pok\xC3\xA9" "Daisy by Lidor Itzhari", "Companion readers and text decoders" },
+            // (Its licence's attribution, word for word, over the card's two lines: NOTICE.)
+            { "Based on PokeDaisy by Lidor Itzhari -", "https://github.com/lidor30/pokedaisy" },
             { "pokebw2, aletheia, pret/pokeplatinum", "Function names from their decompilations" },
             { "DeadSkullzJr's cheat database", "The built-in DS cheats, via libretro-database" },
             { "sphaira", "How the HOME Menu icons are made" },
             { "WeeabooGod", "Cheats menu ideas (PR #16)" },
             { "Nils Menn", "Fucking legend" },
+            { "CharizardMT (GreninjaMaster89)", "Battle buttons, the Mega button, HeartGold fixes" },
+            { "meltingmagnetz", "Help with the Pok\xC3\xA9" "dex" },
+            { "Jeezer", "The tidy folders idea" },
+            { "a1ex", "Battle labels in other languages (PR #171)" },
+            { "OzWookiee", "Cloud saves and Hub fixes, Steam shortcuts (PRs #192, #197, #198)" },
+            { "Saiborg23", "Generation 3 Evolved widescreen (PR #184)" },
+            { "elripalda", "RecompLauncher support (PR #182)" },
             { "Everyone who reported bugs and helped test", "Thank you" } };
-        const int gap = (int)(12 * u), cw = (pw - 2 * ip - gap) / 2, ch = (int)(62 * u);
+        const int nCredits = (int)(sizeof credits / sizeof credits[0]);
+        // (LargeUi: one card a row, its writing kept large; two side by side shrank it to fit.)
+        const int per = LargeUi() ? 1 : 2;
+        const int gap = (int)(12 * u), cw = (pw - 2 * ip - (per - 1) * gap) / per, ch = (int)(62 * u);
         std::vector<Blk> bl;
-        for (int r = 0; r < 5; r++)
-            bl.push_back({ ch + (int)(10 * u), [&, r]() { for (int k = 0; k < 2; k++) { card(px + ip + k * (cw + gap), y, cw, ch, credits[r * 2 + k][0], credits[r * 2 + k][1]); if (*creditUrl[r * 2 + k]) link(px + ip + k * (cw + gap), y, cw, ch, creditUrl[r * 2 + k]); } y += ch + (int)(10 * u); } });
+        for (int r = 0; r < (nCredits + per - 1) / per; r++)
+            bl.push_back({ ch + (int)(10 * u), [&, r, per]() { for (int k = 0; k < per && r * per + k < nCredits; k++) { card(px + ip + k * (cw + gap), y, cw, ch, credits[r * per + k][0], credits[r * per + k][1]); if (*creditUrl[r * per + k]) link(px + ip + k * (cw + gap), y, cw, ch, creditUrl[r * per + k]); } y += ch + (int)(10 * u); } });
         runBlocks(bl, ch + (int)(10 * u));
     }
     else if (F.prow == 2)
@@ -6771,7 +6994,18 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         static const char* lic[][2] = {
             { "Fulldex", "GPL-3.0-or-later" }, { "melonDS", "GPL-3.0" }, { "Pok\xC3\xA9" "Daisy readers", "GPL-3.0" },
             { "HOME Menu icon loader (nx-hbloader)", "GPL-3.0" }, { "mGBA", "MPL-2.0" }, { "The launcher's fonts", "SIL Open Font License" } };
-        const int rh = (int)(44 * u);
+        // (LargeUi: the licence under the name, as both on one line ran into each other.)
+        const bool twoLine = LargeUi();
+        auto fit = [&](std::string t, float fp, bool bold, int w) {
+            if (GW(t, fp, bold) <= w) return t;
+            while (!t.empty() && GW(t + "...", fp, bold) > w)
+            {
+                while (!t.empty() && ((unsigned char)t.back() & 0xC0) == 0x80) t.pop_back();
+                if (!t.empty()) t.pop_back();
+            }
+            return t + "...";
+        };
+        const int rh = (int)((twoLine ? 58 : 44) * u);
         const std::string p1 = "Each font's copyright notice and the full licence text are in FONT-LICENSES.txt, in the fonts folder of the download and on the GitHub page.";
         const std::string p2 = "Not affiliated with or endorsed by Nintendo, Game Freak, The Pok\xC3\xA9mon Company or the melonDS project. Pok\xC3\xA9mon is a trademark of its owners. The full licence texts are on the GitHub page.";
         auto paraH = [&](const std::string& s) { return (int)WrapLines(s, 16 * u, pw - 2 * ip).size() * (int)(24 * u) + (int)(10 * u); };
@@ -6779,8 +7013,16 @@ inline void DrawPage(Canvas& c, const GlassSpots& sp, bool solid, float u)
         for (int i = 0; i < 6; i++)
             bl.push_back({ rh + (int)(6 * u), [&, i]() {
                 Glass::Round(c, px + ip, y, pw - 2 * ip, rh, 12 * u, 0x14FFFFFFu);
+                if (twoLine)
+                {
+                    GT(c, px + ip + (int)(14 * u), y + rh * 0.36f, fit(lic[i][0], 16 * u, true, pw - 2 * ip - (int)(28 * u)), 16 * u, text, true);
+                    GT(c, px + ip + (int)(14 * u), y + rh * 0.72f, lic[i][1], 14 * u, hint, true);
+                }
+                else
+                {
                 GT(c, px + ip + (int)(14 * u), y + rh * 0.5f, lic[i][0], 16 * u, text, true);
                 GT(c, px + pw - ip - (int)(40 * u) - GW(lic[i][1], 15 * u, true), y + rh * 0.5f, lic[i][1], 15 * u, hint, true);
+                }
                 link(px + ip, y, pw - 2 * ip, rh, licUrl[i]);
                 y += rh + (int)(6 * u); } });
         bl.push_back({ (int)(4 * u) + paraH(p1), [&]() { y += (int)(4 * u); para(p1); } });
@@ -6924,7 +7166,8 @@ inline void DrawMusicSquare(Canvas& c, int x, int y, int sz, float u)
     Glass::DrawIcon(c, Glass::I_NEXT, cx + gap, cy, 6.5f * u, m.canNext ? ink : inkOff);
 }
 inline void DrawGlass(Canvas& c, const std::vector<Game>& games, const View& v, int tab, int selected, int& scroll,
-                      const std::string& note, const std::string& hintText, bool follow, bool onTabs, bool settingsChosen)
+                      const std::string& note, const std::string& hintText, bool follow, bool onTabs, bool settingsChosen,
+                      int menuGame = -1)
 {
     // (The launcher's own font and Text Size while it draws; CleanFont's own after.)
     LookLoad();
@@ -6951,6 +7194,7 @@ inline void DrawGlass(Canvas& c, const std::vector<Game>& games, const View& v, 
                     + (bg ? bg->rom + "#" + sig(*bg) : std::string()) + "/"
                     + std::to_string(onTabs) + std::to_string(settingsChosen) + "/" + std::to_string(cont) + "/" + ContinueRom()
                     + "/t" + Focus().pageTitle + "/h" + HubSig() + (Focus().page == SIDE_HUB ? std::to_string(Mover().open) + std::to_string(HubMode()) + "," + std::to_string(Focus().pact) + "," + std::to_string(Focus().rScroll) : std::string()) + "/p" + std::to_string(Focus().page) + "," + std::to_string(Focus().page >= 0 ? Focus().prow : 0) + std::to_string(Focus().page >= 0 && Focus().side < 0) + "/s" + std::to_string(Focus().onSort) + SortKey() + "/q" + SearchText() + "/t" + TabsSig()
+                    + "/b" + std::to_string(Focus().banner) + "/q" + std::to_string(Focus().popup) + "/m" + std::to_string(menuGame)
                     + (Focus().page == SIDE_ROMS ? "/r" + std::to_string(Focus().pact) + "," + std::to_string(RomList().size()) + ","
                        + std::to_string(std::count_if(RomList().begin(), RomList().end(), [](const Game& g) { return g.hidden; })) : std::string());
     if (Focus().page >= 0) key += "/scroll" + std::to_string(Focus().dScroll) + "," + std::to_string(Focus().rScroll) + "," + std::to_string(Focus().nScroll);
@@ -7466,20 +7710,34 @@ inline void DrawGlass(Canvas& c, const std::vector<Game>& games, const View& v, 
 
     // The game's menu (A on a game), beside its card: a glass panel of rows as the sidebar's.
     Focus().popW = 0;
-    if (Focus().popup >= 0 && selected >= 0 && selected < (int)games.size())
+    const int mg = menuGame >= 0 && menuGame < (int)games.size() ? menuGame : selected;
+    if (Focus().popup >= 0 && mg >= 0 && mg < (int)games.size())
     {
-        const int k = v.SpotOf(selected);
-        if (k >= 0)
+        const int k = v.SpotOf(mg);
+        // (from the Game Options button the menu sits under it, so the game need not be in the list shown)
+        if (k >= 0 || (Focus().banner == 2 && !PhoneLook()))
         {
-            static const int icons[] = { Glass::I_PLAY, Glass::I_POKEBALL, Glass::I_SPARKLE, Glass::I_WINDOW, Glass::I_SAVE, Glass::I_LAYERS, Glass::I_BACK };
-            const Game& g = games[selected];
-            const int cx = grid.horiz ? v.spots[k].x - scroll : v.spots[k].x, cyy = grid.horiz ? grid.top + v.spots[k].y : grid.top + v.spots[k].y - scroll;
+            static const int icons[] = { Glass::I_PLAY, Glass::I_POKEBALL, Glass::I_SPARKLE, Glass::I_WINDOW, Glass::I_SAVE, Glass::I_LAYERS, Glass::I_BACK, Glass::I_GLOBE };
+            const Game& g = games[mg];
             const int n = PopupCount(), rowH = (int)(44 * u), rg = (int)(4 * u), pad = (int)(8 * u), pw = (int)(250 * u);
             const int ph = n * rowH + (n - 1) * rg + 2 * pad;
-            int px = cx + grid.cw + (int)(12 * u);
-            if (px + pw > c.w - (int)(28 * u)) px = cx - (int)(12 * u) - pw;
+            int px, py;
+            if (Focus().banner == 2 && !PhoneLook())
+            {
+                // (The Game Options button opened it: the menu sits under that button, not the card.)
+                const int ox = sp.contX + sp.contW + (int)(10 * u);
+                px = ox;
+                py = sp.contY + sp.contH + (int)(12 * u);
+            }
+            else
+            {
+                const int cx = grid.horiz ? v.spots[k].x - scroll : v.spots[k].x, cyy = grid.horiz ? grid.top + v.spots[k].y : grid.top + v.spots[k].y - scroll;
+                px = cx + grid.cw + (int)(12 * u);
+                if (px + pw > c.w - (int)(28 * u)) px = cx - (int)(12 * u) - pw;
+                py = cyy;
+            }
             px = std::max((int)(12 * u), std::min(px, c.w - (int)(12 * u) - pw)); // (upright: no room beside the card, so over it, never off the screen)
-            const int py = std::max((int)(28 * u), std::min(cyy, c.h - (int)(82 * u) - ph));
+            py = std::max((int)(28 * u), std::min(py, c.h - (int)(82 * u) - ph));
             Focus().popX = px + pad; Focus().popY = py + pad; Focus().popW = pw - 2 * pad; Focus().popRow = rowH + rg;
             // (The rest of the screen dimmed, and the blurred background put back under the menu so
             // its glass frosts that, not the cards behind it.)
@@ -7608,7 +7866,8 @@ inline void DrawGlass(Canvas& c, const std::vector<Game>& games, const View& v, 
     // The hints in the bottom right corner, lined up with the cards' right edge: each button a
     // white badge before what it does (a message, when there is one, in their place).
     {
-        const int bx = sp.tabsX, bw = c.w - sp.tabsX - (int)(28 * u), bh = (int)(44 * u), by = c.h - (int)(24 * u) - bh;
+        // (LargeUi: a lower row, close to the foot, below the cards: the phone's layouts run them to it.)
+        const int bx = sp.tabsX, bw = c.w - sp.tabsX - (int)(28 * u), bh = (int)((LargeUi() ? 30 : 44) * u), by = c.h - (int)((LargeUi() ? 3 : 24) * u) - bh;
         const float cy = by + bh * 0.5f;
         if (!note.empty())
         {
@@ -7629,7 +7888,7 @@ inline void DrawGlass(Canvas& c, const std::vector<Game>& games, const View& v, 
             Glass::DrawIcon(c, Glass::I_INFO, x0 + 9 * u, ny, 9 * u, text);
             GTFit(c, x0 + (int)(26 * u), ny, n, fp, tw + 1, text, true);
         }
-        else if (c.h <= c.w && !ShortNow()) // (not upright or a phone sideways: it is a touch screen)
+        else if (c.h <= c.w && (!ShortNow() || LargeUi())) // (not upright or a phone sideways: it is a touch screen)
         {
             const std::string all = !hintText.empty() ? hintText : "A: PLAY    Y: SETTINGS    L / R: TABS    +: QUIT";
             struct Item { std::string key, act; };
@@ -7813,12 +8072,12 @@ inline void DrawClassic(Canvas& c, const std::vector<Game>& games, int tab, int 
 // the sidebar's Settings chosen with the arrows (the classic list draws its own SETTINGS button).
 inline void Draw(Canvas& c, const std::vector<Game>& games, int tab, int selected, int& scroll, const std::string& note,
                  const std::string& hintText = std::string(), const Theme& th = Theme(), bool follow = true, bool onTabs = false,
-                 bool settingsChosen = false)
+                 bool settingsChosen = false, int menuGame = -1)
 {
     if (Glassy(c))
     {
         const View v = MakeView(c, games, tab);
-        DrawGlass(c, games, v, tab, selected, scroll, note, hintText, follow, onTabs, settingsChosen);
+        DrawGlass(c, games, v, tab, selected, scroll, note, hintText, follow, onTabs, settingsChosen, menuGame);
         return;
     }
     DrawClassic(c, games, tab, selected, scroll, note, hintText, th, follow, onTabs);
@@ -7862,6 +8121,29 @@ inline std::vector<Setting> SettingsList()
                   "WHERE YOUR SAVES ARE KEPT. CHOOSE A FOLDER OF YOUR OWN: YOUR SAVES AND FULLDEX FILES ARE COPIED THERE (NOTHING THERE IS REPLACED / THE OLD FOLDER STAYS AS IT IS) "
                   "AND FULLDEX USES IT FROM ITS NEXT START. A FOLDER DROPBOX OR ONEDRIVE OR SYNCTHING KEEPS IN SYNC WORKS TOO. CHOOSE AGAIN TO GO BACK TO THE FOLDER BESIDE THE ROMS." });
 #endif
+#if !defined(__SWITCH__)
+    l.push_back({ "!folders", "FOLDERS", { { "", "TIDY" } }, "",
+                  "TIDY: YOUR SAVES, SAVE STATES, CHEATS AND FULLDEX'S OWN SETTINGS FILES EACH IN A FOLDER OF THEIR OWN (SAVES, STATES, CHEATS, SETTINGS), "
+                  "SO THE ROMS FOLDER KEEPS ONLY THE ROMS. AS BEFORE: ALL OF THEM TOGETHER IN THE SAVES FOLDER. CHOOSE TO SWITCH: EVERY FILE IS COPIED AND "
+                  "CHECKED BEFORE THE OLD ONE IS REMOVED. A SAVES FOLDER OF YOUR OWN IS LEFT AS IT IS." });
+#endif
+#ifdef __ANDROID__
+    l.push_back({ "!saves_folder", "SAVES FOLDER", { { "", "FULLDEX'S" } }, "",
+                  "WHERE YOUR SAVES ARE KEPT. CHOOSE A FOLDER OF YOUR OWN (ONE SYNCTHING KEEPS IN SYNC, SAY): YOUR SAVES ARE COPIED THERE "
+                  "(NOTHING THERE IS REPLACED / THE OLD ONES STAY) AND IT IS USED FROM THEN ON. CHOOSE AGAIN TO GO BACK TO FULLDEX'S OWN." });
+#endif
+#if !defined(__SWITCH__)
+    l.push_back({ "!states_folder", "SAVE STATES FOLDER", { { "", "FULLDEX'S" } }, "",
+                  "WHERE YOUR SAVE STATES ARE KEPT. CHOOSE A FOLDER OF YOUR OWN (A SYNCTHING OR RETROARCH ONE, SAY): THE ONES YOU HAVE ARE "
+                  "COPIED THERE (NOTHING THERE IS REPLACED / THE OLD ONES STAY) AND IT IS USED AT ONCE. CHOOSE AGAIN TO GO BACK TO FULLDEX'S OWN." });
+    l.push_back({ "!cheats_folder", "CHEATS FOLDER", { { "", "FULLDEX'S" } }, "",
+                  "WHERE YOUR CHEATS AND WHICH ARE ON ARE KEPT. CHOOSE A FOLDER OF YOUR OWN: THEY ARE COPIED THERE (NOTHING THERE IS REPLACED) "
+                  "AND IT IS USED AT ONCE. CHOOSE AGAIN TO GO BACK TO FULLDEX'S OWN." });
+    l.push_back({ "!settings_folder", "SETTINGS FOLDER", { { "", "FULLDEX'S" } }, "",
+                  "WHERE FULLDEX'S OWN FILES ARE KEPT: YOUR TABS, GAME NAMES, HIDDEN GAMES, PICTURES, LOOK AND PLAY TIME. CHOOSE A FOLDER OF YOUR OWN "
+                  "TO BACK THEM UP OR SHARE THEM BETWEEN DEVICES: THEY ARE COPIED THERE (NOTHING THERE IS REPLACED) AND IT IS USED AT ONCE. "
+                  "CHOOSE AGAIN TO GO BACK TO FULLDEX'S OWN." });
+#endif
     l.push_back({ "!releases", "RELEASE PAGE", { { "", "OPEN" } }, "",
                   "OPENS THE LIST OF RELEASES ON GITHUB: THE CHANGES IN EACH VERSION, AND THE DOWNLOADS." });
     l.push_back({ nullptr, "RELEASE NOTES", {}, "",
@@ -7887,6 +8169,8 @@ inline std::vector<Setting> SettingsList()
 #endif
     l.push_back({ "fast_button", "FAST FORWARD BUTTON", { { "hold", "HOLD" }, { "toggle", "TOGGLE" } }, "hold",
                   "HOLD: RELEASE TO STOP. TOGGLE: PRESS ONCE TO START AND AGAIN TO STOP. APPLIES TO KEYBOARD, CONTROLLER AND ON-SCREEN FAST FORWARD." });
+    l.push_back({ "aspect", "ASPECT RATIO", { { "auto", "AUTO" }, { "16:9", "16:9" }, { "16:10", "16:10" }, { "3:2", "3:2" }, { "4:3", "4:3" } }, "auto",
+                  "DS GAMES: THE SHAPE OF THE PICTURE. AUTO FILLS YOUR SCREEN; A NARROWER SHAPE LEAVES BARS AT THE SIDES. THE SAME CHOICE IS IN THE GAME'S DISPLAY MENU." });
     l.push_back({ "smooth", "SMOOTH SCALING", onOff, "0", "ON: THE PICTURE IS SOFTENED AS IT IS SCALED UP TO YOUR SCREEN. OFF: SHARP PIXELS." });
     l.push_back({ "screen_filter", "DS SCREEN FILTER", { { "0", "OFF" }, { "1", "SCANLINES" }, { "2", "LCD GRID" } }, "0",
                   "DS GAMES: A RETRO LOOK OVER THE PICTURE. LCD GRID ADDS A FAINT PIXEL GRID. THE SAME CHOICE IS AVAILABLE IN THE GAME'S DISPLAY MENU." });
@@ -7894,9 +8178,11 @@ inline std::vector<Setting> SettingsList()
                   "GBA GAMES: A FAINT GRID BETWEEN THE PIXELS. AUTO KEEPS YOUR EXISTING GBA SETTING. CHANGES IN THE GAME'S DISPLAY MENU ARE REMEMBERED HERE." });
     l.push_back({ "wide", "WIDESCREEN WORLD", onOff, "1", "ON: THE 3D WORLD IS DRAWN OUT TO THE SIDES OF THE 16:9 SCREEN. OFF: ONLY AS WIDE AS A DS SCREEN." });
     l.push_back({ "wide_map", "WIDE MAP LOADING", onOff, "1", "BLACK / WHITE / BLACK 2 / WHITE 2: LOADS MORE OF THE MAP AROUND YOU SO THE WIDE VIEW HAS LAND AT ITS EDGES." });
-    l.push_back({ "battle_buttons", "BATTLE BUTTONS", { { "corner", "CORNER" }, { "panel", "PANEL" }, { "strip", "STRIP" } }, "strip",
+    l.push_back({ "battle_buttons", "BATTLE BUTTONS", { { "corner", "CORNER" }, { "panel", "PANEL" }, { "strip", "STRIP" }, { "classic", "CLASSIC" }, { "sunmoon", "SUN AND MOON" } }, "strip",
                   "WHERE THE BATTLE MENU GOES. CORNER: SMALL BUTTONS IN A CORNER. PANEL: THE FIGHT / BAG / POKEMON / RUN PANEL FROM THE GAME BESIDE THE BATTLE. "
-                  "STRIP: LARGE BUTTONS IN THE MESSAGE BOX IN BLACK AND WHITE (CORNER IN THE OTHERS). SOULSILVER / HEARTGOLD / PLATINUM HAVE THEIR OWN." });
+                  "STRIP: ROUNDED BUTTONS ON THE MESSAGE BOX IN BLACK, WHITE, BLACK 2 AND WHITE 2. "
+                  "CLASSIC: THE EARLIER STRIP, WITH THE GAME'S OWN BUTTONS. SOULSILVER / HEARTGOLD / PLATINUM HAVE THEIR OWN. "
+                  "SUN AND MOON: FIGHT ACROSS THE TOP, POKEMON / BAG / RUN BELOW IT, AS POKEMON SUN AND MOON HAVE THEM, IN EVERY DS GAME." });
 #ifdef __SWITCH__
     l.push_back({ "wide_lines", "WORLD DETAIL", { { "192", "192" }, { "288", "288" }, { "384", "384" }, { "540", "540" }, { "720", "720" } }, "",
                   "HOW MANY LINES THE WIDE 3D WORLD IS DRAWN WITH. 720 IS FULL SHARPNESS ON THE SWITCH. LOWER IS LIGHTER ON THE CONSOLE." });
@@ -7923,6 +8209,9 @@ inline std::vector<Setting> SettingsList()
 #endif
 #endif
     l.push_back({ "show_fps", "FPS COUNTER", onOff, "0", "SHOWS THE FRAMES A SECOND IN A CORNER." });
+    l.push_back({ "ui_size", "UI SIZE", { { "auto", "AUTO" }, { "100", "1X" }, { "125", "1.25X" }, { "150", "1.5X" }, { "175", "1.75X" }, { "200", "2X" } }, "auto",
+                  "HOW LARGE THE MENUS, THIS LIST AND THE OVERLAYS OVER THE GAME ARE. AUTO: 1.5X ON A HANDHELD'S SCREEN UNDER 720 LINES, "
+                  "1X ON LARGER ONES, PHONES AND THE SWITCH. THE LIST CHANGES THE NEXT TIME IT OPENS." });
     l.push_back({ "volume", "VOLUME", { { "0", "OFF" }, { "10", "10%" }, { "20", "20%" }, { "30", "30%" }, { "40", "40%" }, { "50", "50%" }, { "60", "60%" }, { "70", "70%" }, { "80", "80%" }, { "90", "90%" }, { "100", "100%" } }, "100",
                   "THE GAME'S SOUND AND MUSIC. OFF FOR NONE. ALSO IN THE PAUSE MENU WHILE YOU PLAY." });
 #ifdef __SWITCH__
@@ -7948,6 +8237,11 @@ inline std::vector<Setting> SettingsList()
 #elif !defined(__APPLE__)
     l.push_back({ "!shortcuts", "DESKTOP SHORTCUTS", { { "", "CREATE" } }, "",
                   "PUTS A SHORTCUT FOR EACH GAME IN THIS LIST ON YOUR DESKTOP AND IN YOUR APPS MENU WITH ITS PICTURE. IT STARTS THAT GAME STRAIGHT AWAY. ON THE STEAM DECK THEY ALSO SHOW UP IN ADD A NON-STEAM GAME. CREATE AGAIN AFTER ADDING GAMES OR MOVING THIS FOLDER." });
+    const std::string steamLauncher = PlatformLauncherState() ? PlatformLauncherState()() : "NOT IN STEAM";
+    l.push_back({ "!steam_launcher", "STEAM LAUNCHER", { { "", steamLauncher } }, "",
+                  "ADDS FULLDEX ITSELF TO YOUR STEAM LIBRARY, NOT THE GAMES. QUIT STEAM FIRST, THEN CHOOSE THIS (THE MESSAGE SAYS HOW TO REOPEN IT). WHEN IT IS ALREADY IN STEAM, CHOOSE THIS TO TAKE IT OUT. WHEN STEAM IS NOT INSTALLED, A GAME'S MENU OFFERS ADD TO DESKTOP INSTEAD." });
+    l.push_back({ "!steam_refresh", "STEAM ACCOUNT", { { "", "REFRESH" } }, "",
+                  "FINDS THE STEAM ACCOUNT SIGNED IN LAST AND ITS shortcuts.vdf AGAIN (AFTER SWITCHING ACCOUNTS OR MOVING STEAM) AND SAVES THEM IN settings.cfg AS steam_account AND steam_shortcuts. THE VALUE SHOWS THE ACCOUNT FOUND." });
 #endif
 #endif
 #endif
@@ -8030,12 +8324,13 @@ inline int GroupOf(const Setting& s)
     if (s.key && (!strcmp(s.key, "!updates") || !strcmp(s.key, "!releases"))) return 8;
     if (s.key && !strcmp(s.key,"!favourite")) return 6;
     if (s.key && !strcmp(s.key, "!saves_folder")) return 6; // (GAME LIST)
+    if (s.key && (!strcmp(s.key, "!folders") || !strcmp(s.key, "!states_folder") || !strcmp(s.key, "!cheats_folder") || !strcmp(s.key, "!settings_folder"))) return 6;
     if (!s.key) return !strcmp(s.name, "KEYS AND BUTTONS") ? 3 : !strcmp(s.name, "RELEASE NOTES") ? 8 : 7;
     if (!strncmp(s.key,"extra_",6)) return 9;
     if (!strcmp(s.key, "list_lang")) return 0;
     if (!strncmp(s.key, "list_", 5)) return 6;
     if (!strcmp(s.key, "ra") || !strcmp(s.key, "!ra_login")) return 7;
-    static const char* display[] = { "view", "large_screen", "fullscreen", "smooth", "screen_filter", "gba_lcd", "battle_buttons", "show_fps" };
+    static const char* display[] = { "view", "large_screen", "fullscreen", "aspect", "smooth", "screen_filter", "gba_lcd", "battle_buttons", "show_fps", "ui_size" };
     static const char* controls[] = { "start_button", "buttons", "pad_touch", "fast_button" };
     for (const char* k : display)
         if (!strcmp(s.key, k)) return 1;
@@ -8318,10 +8613,10 @@ struct SettingsPage
 inline std::string SettingSentence(const std::string& s)
 {
     for (char ch : s) if (ch >= 'a' && ch <= 'z') return s;
-    static const char* const keep[] = { "FPS", "HUD", "GBA", "DS", "3D", "2D", "PC", "OK", "B", "X", "Y", "L", "R", "ZL", "ZR", "MB", "GPU",
+    static const char* const keep[] = { "FPS", "HUD", "GBA", "DS", "3D", "2D", "PC", "OK", "B", "X", "L", "R", "ZL", "ZR", "MB", "GPU",
                                         "CPU", "JIT", "LCD", "ROM", "ROMS", "SD", "HOME", "USB", "AUTO", "PS", "NDS", "UI", "4X", "2X", "16:9" };
     static const std::pair<const char*, const char*> spelt[] = { { "POKEMON", "Pok\xC3\xA9mon" }, { "POKEDEX", "Pok\xC3\xA9" "dex" },
-        { "GITHUB", "GitHub" }, { "RETROACHIEVEMENTS", "RetroAchievements" }, { "XBOX", "Xbox" }, { "JOY", "Joy" }, { "CON", "Con" },
+        { "GITHUB", "GitHub" }, { "RETROACHIEVEMENTS", "RetroAchievements" }, { "XBOX", "Xbox" }, { "JOY", "Joy" },
         { "MISSIONCONTROL", "MissionControl" }, { "SYS", "sys" }, { "FULLDEX", "Fulldex" }, { "WINDOWS", "Windows" }, { "MAC", "Mac" },
         { "LINUX", "Linux" }, { "ANDROID", "Android" }, { "IPHONE", "iPhone" }, { "SWITCH", "Switch" }, { "STEAM", "Steam" } };
     std::string out;
@@ -8336,7 +8631,12 @@ inline std::string SettingSentence(const std::string& s)
         bool kept = false;
         for (const char* k : keep) if (w == k) kept = true;
         for (const auto& sp : spelt) if (w == sp.first) { w = sp.second; kept = true; }
-        if (w == "A")
+        // (CON: Joy-Con's, after "Joy-"; elsewhere the Spanish and Italian word "con".)
+        if (w == "CON" && out.size() >= 4 && out.compare(out.size() - 4, 4, "Joy-") == 0) { w = "Con"; kept = true; }
+        // (Y: the button in English; in the other languages the Spanish "y" (and) is far more
+        // often meant, so there only as the button, as A below: "Y el menú", not "Y el menÚ".)
+        if (w == "Y" && UiLang::lang == 0) kept = true;
+        else if (w == "A" || w == "Y")
         {
             // (The button: before ":" or "/", before PLAYS / BUTTON, after "/" or THE.)
             size_t k = j;
@@ -8346,9 +8646,7 @@ inline std::string SettingSentence(const std::string& s)
             kept = (k < s.size() && (s[k] == ':' || s[k] == '/')) || next.compare(0, 5, "PLAYS") == 0 || next.compare(0, 6, "BUTTON") == 0 ||
                    (!out.empty() && out.find_last_not_of(' ') != std::string::npos && out[out.find_last_not_of(' ')] == '/') || before == "the ";
         }
-        if (!kept)
-            for (size_t k = start ? 1 : 0; k < w.size(); k++)
-                if (w[k] >= 'A' && w[k] <= 'Z') w[k] += 32;
+        if (!kept) UiLang::LowerLatin(w, start ? 1 : 0);
         out += w;
         start = false;
         i = j;
@@ -8363,11 +8661,11 @@ inline int SettingIcon(const Setting& s, int group)
     if (s.key && !strncmp(s.key, "!group", 6)) { const int g = atoi(s.key + 6); return g >= 0 && g < 10 ? groupIcon[g] : Glass::I_GEAR; }
     if (!s.key) return Glass::I_INFO;
     static const std::pair<const char*, int> own[] = {
-        { "view", Glass::I_LAYOUT }, { "large_screen", Glass::I_EXPAND }, { "fullscreen", Glass::I_FULLSCREEN }, { "smooth", Glass::I_SCREENS },
+        { "view", Glass::I_LAYOUT }, { "large_screen", Glass::I_EXPAND }, { "fullscreen", Glass::I_FULLSCREEN }, { "aspect", Glass::I_RATIO }, { "smooth", Glass::I_SCREENS },
         { "screen_filter", Glass::I_SPARKLE }, { "gba_lcd", Glass::I_SPARKLE }, { "battle_buttons", Glass::I_PAD }, { "show_fps", Glass::I_GAUGE }, { "fps60", Glass::I_FAST }, { "wide", Glass::I_RATIO },
         { "wide_map", Glass::I_GLOBE }, { "wide_lines", Glass::I_LAYERS }, { "busy_detail", Glass::I_GAUGE }, { "ff_low_res", Glass::I_FAST },
         { "wide_gpu", Glass::I_CHIP }, { "volume", Glass::I_SPEAKER }, { "start_button", Glass::I_PAD }, { "buttons", Glass::I_PAD },
-        { "pad_touch", Glass::I_PAD }, { "!keys", Glass::I_PAD }, { "!shortcuts", Glass::I_WINDOW }, { "!forwarders", Glass::I_WINDOW },
+        { "pad_touch", Glass::I_PAD }, { "!keys", Glass::I_PAD }, { "!shortcuts", Glass::I_WINDOW }, { "!steam_launcher", Glass::I_GLOBE }, { "!steam_refresh", Glass::I_GLOBE }, { "!forwarders", Glass::I_WINDOW },
         { "list_lang", Glass::I_GLOBE }, { "ra", Glass::I_TROPHY }, { "!ra_login", Glass::I_PEOPLE }, { "!updates", Glass::I_LOAD }, { "!releases", Glass::I_GLOBE } };
     for (const auto& o : own)
         if (!strcmp(s.key, o.first)) return o.second;
@@ -8502,6 +8800,9 @@ inline void BuildSettingsMenu(Menu& m, std::vector<int>& map, const SettingsPage
             it.preview = kk == "view" ? Menu::P_LAYOUT : kk == "large_screen" ? Menu::P_LARGE : kk == "aspect" ? Menu::P_ASPECT : kk == "fullscreen" ? Menu::P_FULLSCREEN
                        : kk == "screen_filter" ? Menu::P_FILTER : kk == "smooth" ? Menu::P_SMOOTH : kk == "battle_buttons" ? Menu::P_BATTLE : kk == "show_fps" ? Menu::P_FPS : kk == "wide" ? Menu::P_WIDE
                        : kk == "fps60" ? Menu::P_MOTION : -1;
+            // (BATTLE BUTTONS' pictures in its choices' order: CORNER, PANEL, STRIP, CLASSIC (STRIP's),
+            // SUN AND MOON.)
+            if (kk == "battle_buttons") it.art = { 0, 2, 1, 1, 3 };
         }
         m.items.push_back(it);
         map.push_back((int)i);
@@ -8509,4 +8810,36 @@ inline void BuildSettingsMenu(Menu& m, std::vector<int>& map, const SettingsPage
     m.selected = onBack ? 0 : std::max(0, std::min((int)m.items.size() - 1, p.selected + 1));
 }
 
+}
+
+// Lines of a settings file set (key=value) or, for an empty value, taken out; the others kept.
+// (The launcher and the Steam writer both keep settings in settings.cfg.)
+inline void SetConfigValues(const std::string& cfg, const std::vector<std::pair<std::string, std::string>>& values)
+{
+    std::vector<std::string> lines;
+    if (FILE* f = fopen(cfg.c_str(), "r"))
+    {
+        char line[1024];
+        while (fgets(line, sizeof line, f))
+        {
+            std::string l = line;
+            while (!l.empty() && (l.back() == '\n' || l.back() == '\r')) l.pop_back();
+            bool set = false;
+            for (const auto& kv : values) set |= l.size() > kv.first.size() && !l.compare(0, kv.first.size(), kv.first) && l[kv.first.size()] == '=';
+            if (!set) lines.push_back(l);
+        }
+        fclose(f);
+    }
+    for (const auto& kv : values)
+        if (!kv.second.empty()) lines.push_back(kv.first + "=" + kv.second);
+    const std::string tmp = cfg + ".tmp";
+    if (FILE* f = fopen(tmp.c_str(), "w"))
+    {
+        bool ok = true;
+        for (const std::string& l : lines) if (fprintf(f, "%s\n", l.c_str()) < 0) ok = false;
+        ok = fclose(f) == 0 && ok;
+        std::error_code ec;
+        if (ok) std::filesystem::rename(tmp, cfg, ec);
+        if (!ok || ec) fprintf(stderr, "[launcher] settings could not be saved: %s\n", cfg.c_str());
+    }
 }
