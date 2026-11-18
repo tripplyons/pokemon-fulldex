@@ -13,7 +13,8 @@ class ReadFileTests(unittest.TestCase):
     def test_seek_tell_and_short_read_fail_without_invalid_allocation(self):
         main = (ROOT / 'frontend/main.cpp').read_text()
         start = main.index('static std::vector<uint8_t> ReadFile(')
-        end = main.index('static bool FlushSave(', start)
+        # Only the function's closing brace starts at the left margin.
+        end = main.index('\n}', start) + len('\n}')
         with tempfile.TemporaryDirectory() as folder:
             temp = Path(folder)
             source = temp / 'reader.cpp'
